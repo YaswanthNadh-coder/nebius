@@ -1,60 +1,60 @@
 # ⏳ SQL Migration "Dry-Run Time Machine"
 
-> **Nebius × NVIDIA Global AI Hackathon — Coding & Agentic Engineering Track**
+> **Nebius x NVIDIA Global AI Hackathon (Coding and Agentic Engineering Track)**
 
-An autonomous coding agent that eliminates the fear of running destructive SQL schema migrations. It drafts, tests, and self-heals migration scripts entirely in RAM — so your production database is never touched.
-
----
-
-## 🧠 How It Works
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│  1. SEED        Faker populates 1,000 adversarial rows in RAM   │
-│  2. DRAFT       Nemotron 3 Super generates initial SQL migration │
-│  3. CLONE       sqlite3.backup() snapshots the DB in <5 ms      │
-│  4. VERIFY      Deterministic assertions catch silent data loss  │
-│  5. SELF-HEAL   Nemotron 3 Ultra rewrites lossless SQL if needed │
-│  6. REPEAT      Fresh clone → re-verify until 1,000/1,000 pass  │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-### Tiered Model Routing (Nebius Token Factory)
-
-| Stage | Model | Why |
-|-------|-------|-----|
-| Fast Draft | **NVIDIA Nemotron 3 Super** | Low-latency first-pass SQL generation |
-| Self-Heal | **NVIDIA Nemotron 3 Ultra** | Deep reasoning over failure telemetry to synthesize lossless patches |
-
-Both models are accessed through the **Nebius Token Factory** API (`https://api.tokenfactory.nebius.com/v1/`), which provides serverless inference with zero infrastructure overhead.
-
-### Sub-5 ms RAM Cloning
-
-Instead of writing to disk, the agent uses **`sqlite3.Connection.backup()`** to clone the entire in-memory database in under 5 milliseconds. Each verification attempt runs against a disposable clone, so the original seeded snapshot is never mutated.
-
-### Adversarial Edge Cases
-
-The synthetic dataset is deliberately injected with production traps that break naive migrations:
-
-- **NULL foreign keys** — `dept_code IS NULL` causes `INNER JOIN` to silently drop rows
-- **Unmapped legacy codes** — `'LEGACY_99'` has no match in `departments`
-- **Single-word names** — `'Madonna'` breaks `SUBSTR`/`INSTR` splitting on space
-- **Unicode & apostrophes** — `"O'Reilly 🚀"` tests string-handling robustness
-- **Dollar-prefixed salary strings** — `'$85000'` and `NULL` test `CAST`/`REPLACE` pipelines
+An autonomous coding agent that eliminates the fear of running destructive SQL schema migrations by combining in-memory SQLite sandboxing with tiered **NVIDIA Nemotron** models hosted on **Nebius Token Factory**.
 
 ---
 
-## 🚀 Quick Start
+## 🎯 The Problem
 
-### 1. Clone & Enter the Project
+Running database migrations in production is terrifying. A single naive `INNER JOIN` against legacy unmapped records or unhandled `NULL` foreign keys can silently drop thousands of customer records forever. Hand-writing rollback scripts or testing migrations against staging databases with stale or sanitized data fails to catch dirty production edge cases.
 
-```bash
-cd nebius
+---
+
+## 💡 The Solution: Dry-Run Time Machine
+
+The SQL Migration Time Machine provides an ephemeral, safe dry-run environment:
+
+1. **Adversarial In-Memory Seeding:** Spins up an ephemeral in-memory SQLite database (`:memory:`) and uses `Faker` to populate 1,000 realistic rows injected with production traps:
+   - `NULL` foreign keys
+   - Unmapped legacy department codes (`LEGACY_99`)
+   - Mononyms and single-word names (`Madonna`)
+   - Unicode and apostrophes (`O'Reilly 🚀`)
+   - Dollar-prefixed currency strings (`$85000`) and missing salary values
+2. **Tiered LLM Routing on Nebius Token Factory:**
+   - **Fast Draft (Nemotron 3 Super):** Generates a fast first-pass SQLite migration script.
+   - **Self-Healing (Nemotron 3 Ultra):** If verification fails, escalates the failure report and failed SQL to Nemotron 3 Ultra to synthesize a lossless self-healed patch (`LEFT JOIN`, `COALESCE`, safe `INSTR`/`SUBSTR`, `CAST/REPLACE`).
+3. **Sub-5ms RAM Snapshots:** Uses `sqlite3.Connection.backup()` to clone the entire seeded database in RAM in `< 5ms`. Each dry-run executes in a completely disposable clone without touching disk or the original state.
+4. **Deterministic Mathematical Assertions:**
+   - Detects silent row drops (`before_count == after_count`).
+   - Audits required target columns (`id`, `first_name`, `last_name`, `dept_code`, `salary_num`, `is_active`).
+   - Catches `NULL` corruption in non-nullable target columns.
+
+---
+
+## 📁 Workspace File Structure
+
+```text
+.
+├── .gitignore          # Git ignore specifications
+├── .env.example        # Environment variable template
+├── .env                # Your Nebius API key (git-ignored)
+├── requirements.txt    # Python dependencies
+├── scenarios.py        # Pre-built adversarial SQL migration scenarios
+├── agent.py            # Core agent logic: seeding, RAM cloning, verification & self-healing
+├── app.py              # Streamlit interactive web dashboard
+├── test_agent.py       # CLI smoke test script
+└── README.md           # Project documentation
 ```
 
-### 2. Create Virtual Environment
+---
 
-**Windows:**
+## 🚀 Quick Start Guide
+
+### 1. Create and Activate Virtual Environment
+
+**Windows (PowerShell):**
 ```powershell
 python -m venv venv
 .\venv\Scripts\Activate.ps1
@@ -66,29 +66,27 @@ python3 -m venv venv
 source venv/bin/activate
 ```
 
-### 3. Install Dependencies
+### 2. Install Dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 4. Set Your API Key
+### 3. Configure Your Nebius API Key
 
-Edit the `.env` file and replace the placeholder with your real Nebius Token Factory key:
+In `.env`, paste your Nebius Token Factory API key:
 
 ```env
-NEBIUS_API_KEY=your_real_key_here
+NEBIUS_API_KEY=your_actual_nebius_api_key_here
 ```
 
-### 5. Launch the App
+### 4. Run the Streamlit Application
 
 ```bash
 streamlit run app.py
 ```
 
-The Streamlit UI will open in your browser. Select a scenario, click **"🚀 Run Adversarial Time-Machine Dry Run"**, and watch the agent draft → fail → self-heal in real time.
-
-### 6. (Optional) CLI Smoke Test
+### 5. (Optional) Run the CLI Smoke Test
 
 ```bash
 python test_agent.py
@@ -96,42 +94,10 @@ python test_agent.py
 
 ---
 
-## 📁 Project Structure
+## 🏗️ Architecture & Technologies
 
-```
-.
-├── .gitignore          # Git ignore rules
-├── .env.example        # Template for required environment variables
-├── .env                # Your actual API key (git-ignored)
-├── requirements.txt    # Python dependencies
-├── scenarios.py        # Pre-built adversarial migration scenarios
-├── agent.py            # Core agent: seeder, cloner, verifier, self-heal loop
-├── app.py              # Streamlit UI
-├── test_agent.py       # CLI smoke test
-└── README.md           # This file
-```
-
----
-
-## 🔑 Key Technical Decisions
-
-1. **In-Memory Only** — Zero disk I/O. The entire pipeline runs in RAM using `sqlite3.connect(":memory:")`, making it safe and fast.
-2. **Deterministic Assertions** — No LLM is used to judge pass/fail. Row counts, column presence, and NULL checks are pure mathematical comparisons.
-3. **Tiered Cost Optimization** — The cheaper/faster Nemotron Super handles the optimistic first draft. The more expensive Nemotron Ultra is only invoked when the sandbox catches a real failure.
-4. **Automatic Model Discovery** — `resolve_nebius_models()` queries the Nebius API to detect the exact model IDs available on your account, with graceful fallback to defaults.
-
----
-
-## 🏗️ Built With
-
-- [Nebius Token Factory](https://nebius.com/) — Serverless NVIDIA GPU inference
-- [NVIDIA Nemotron 3 Super & Ultra](https://build.nvidia.com/) — Tiered LLM reasoning
-- [Streamlit](https://streamlit.io/) — Interactive web UI
-- [Faker](https://faker.readthedocs.io/) — Realistic synthetic data generation
-- [SQLite3](https://docs.python.org/3/library/sqlite3.html) — In-memory database with `backup()` cloning
-
----
-
-## 📄 License
-
-MIT — built for the Nebius × NVIDIA Global AI Hackathon.
+- **Nebius Token Factory:** Serverless OpenAI-compatible inference endpoint (`https://api.tokenfactory.nebius.com/v1/`).
+- **NVIDIA Nemotron 3 Super & Ultra:** Tiered fast drafting and deep agentic self-healing.
+- **SQLite In-Memory (`:memory:`):** Fast, isolated, zero-disk database sandboxing.
+- **Faker:** Synthetic dirty data generation simulating real-world production data.
+- **Streamlit:** Interactive visual timeline displaying attempts, metrics, failure telemetry, and verified output rows.

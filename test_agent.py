@@ -1,8 +1,15 @@
 """CLI smoke test to verify Nebius API connection and the SQLite Time Machine loop."""
 import os
+import sys
 from dotenv import load_dotenv
 from scenarios import SCENARIOS
 from agent import get_client, resolve_nebius_models, run_time_machine_agent
+
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 load_dotenv()
 
