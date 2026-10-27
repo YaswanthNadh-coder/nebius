@@ -152,7 +152,7 @@ class Settings(BaseModel):
         description="HTTP client timeout for LLM requests",
     )
     agent_wall_clock_timeout_s: float = Field(
-        default=180.0,
+        default=300.0,
         description="Maximum total wall-clock budget in seconds for an agent execution run",
     )
     max_tool_rounds_per_step: int = Field(

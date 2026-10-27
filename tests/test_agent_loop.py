@@ -850,6 +850,41 @@ def test_agent_preserves_conversation_messages_on_no_sql_retry():
     assert "no executable migration SQL" in third_call_messages[-1]["content"]
 
 
+def test_run_on_clone_handles_read_queries():
+    """When model passes a read-only query to run_on_clone, it returns query_result with sample rows instead of failing invariants."""
+    from timemachine.agent.tools import ToolExecutor
+
+    adapter = SQLiteAdapter.create_in_memory()
+    conn = adapter.open_readonly()
+    conn.execute("CREATE TABLE departments (dept_code TEXT PRIMARY KEY, dept_name TEXT);")
+    conn.execute("INSERT INTO departments VALUES ('ENG', 'Engineering'), ('MKT', 'Marketing');")
+    conn.commit()
+
+    executor = ToolExecutor(adapter, target_table="employees")
+    res = executor.execute("run_on_clone", json.dumps({"up_sql": "SELECT dept_code, dept_name FROM departments ORDER BY dept_code;"}))
+
+    assert res.get("status") == "query_result"
+    assert "dept_code" in res.get("columns", [])
+    assert res.get("count") == 2
+    assert len(res.get("sample_rows", [])) == 2
+
+
+def test_call_llm_reports_actual_timeout_in_error():
+    """When call_llm encounters APITimeoutError, the error message reflects the specific timeout passed."""
+    from openai import APITimeoutError
+
+    from timemachine.agent.llm import call_llm
+
+    client = MagicMock()
+    client.chat.completions.create.side_effect = APITimeoutError("Request timed out")
+
+    with pytest.raises(AgentError) as exc_info:
+        call_llm(client, "test-model", "test prompt", timeout=12.5)
+
+    assert "timed out (12s)" in str(exc_info.value)
+
+
+
 
 
 

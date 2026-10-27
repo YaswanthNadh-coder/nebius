@@ -286,10 +286,12 @@ def run_time_machine_agent(
         step_num += 1
         elapsed_total = time.time() - start_time
         if elapsed_total > wall_clock_budget:
+            final_up = current_up_sql or (last_tool_sql if has_ddl_or_dml(last_tool_sql) else "")
+            final_down = current_down_sql or (last_tool_down_sql if last_tool_down_sql else "")
             return AgentRunResult(
                 status="FAILED",
-                up_sql=current_up_sql,
-                down_sql=current_down_sql,
+                up_sql=final_up,
+                down_sql=final_down,
                 spec=spec,
                 steps=steps,
                 invariant_result=inv_result,
@@ -336,7 +338,6 @@ def run_time_machine_agent(
             prompt = build_repair_prompt(schema, spec, sql_to_repair, inv_result, trap_results=traps)
             messages = [{"role": "user", "content": prompt}]
 
-
         step_up_sql = ""
         step_down_sql = ""
         tool_rounds = 0
@@ -346,7 +347,13 @@ def run_time_machine_agent(
 
         while tool_rounds < max_tool_rounds:
             tool_rounds += 1
-            remaining_s = max(1.0, wall_clock_budget - (time.time() - start_time))
+            remaining_s = wall_clock_budget - (time.time() - start_time)
+            if remaining_s < 15.0:
+                logger.warning(
+                    f"Wall-clock budget nearly exhausted ({remaining_s:.1f}s remaining). "
+                    "Stopping tool loop to finalize migration."
+                )
+                break
             step_start = time.time()
 
             try:
@@ -370,10 +377,12 @@ def run_time_machine_agent(
                         status="error",
                     )
                 )
+                final_up = current_up_sql or (last_tool_sql if has_ddl_or_dml(last_tool_sql) else "")
+                final_down = current_down_sql or (last_tool_down_sql if last_tool_down_sql else "")
                 return AgentRunResult(
                     status="FAILED",
-                    up_sql=current_up_sql,
-                    down_sql=current_down_sql,
+                    up_sql=final_up,
+                    down_sql=final_down,
                     spec=spec,
                     steps=steps,
                     invariant_result=inv_result,
@@ -448,15 +457,17 @@ def run_time_machine_agent(
                         step_down_sql = res.get("down_sql", "")
                         notes = res.get("notes", "")
                     elif fn_name == "run_on_clone":
-                        inv_result = InvariantResult.model_validate(res)
                         try:
                             p_args = json.loads(fn_args) if isinstance(fn_args, str) else fn_args
-                            if isinstance(p_args, dict) and "up_sql" in p_args and p_args["up_sql"]:
-                                last_tool_sql = p_args["up_sql"]
+                            candidate_sql = p_args.get("up_sql", "") if isinstance(p_args, dict) else ""
+                            if candidate_sql and has_ddl_or_dml(candidate_sql):
+                                last_tool_sql = candidate_sql
                                 if "down_sql" in p_args and p_args["down_sql"]:
                                     last_tool_down_sql = p_args["down_sql"]
                                     if not step_down_sql:
                                         step_down_sql = p_args["down_sql"]
+                                if res.get("status") in ("VERIFIED", "UNVERIFIED", "FAILED", "PASSED"):
+                                    inv_result = InvariantResult.model_validate(res)
                         except Exception:
                             pass
 
@@ -477,9 +488,9 @@ def run_time_machine_agent(
                 break
 
         # If tool rounds budget was exhausted after tool calls and no SQL produced yet,
-        # prompt model once more so it can inspect tool outputs and deliver final SQL or submit.
-        if not step_up_sql and messages and messages[-1].get("role") == "tool":
-            remaining_s = max(1.0, wall_clock_budget - (time.time() - start_time))
+        # prompt model once more so it can inspect tool outputs and deliver final SQL or submit (if budget permits).
+        remaining_s = wall_clock_budget - (time.time() - start_time)
+        if not step_up_sql and remaining_s >= 15.0 and messages and messages[-1].get("role") == "tool":
             step_start = time.time()
             final_reminder = {
                 "role": "user",
@@ -542,8 +553,9 @@ def run_time_machine_agent(
                         elif fn_name == "run_on_clone":
                             try:
                                 p_args = json.loads(fn_args) if isinstance(fn_args, str) else fn_args
-                                if isinstance(p_args, dict) and "up_sql" in p_args and p_args["up_sql"]:
-                                    last_tool_sql = p_args["up_sql"]
+                                candidate_sql = p_args.get("up_sql", "") if isinstance(p_args, dict) else ""
+                                if candidate_sql and has_ddl_or_dml(candidate_sql):
+                                    last_tool_sql = candidate_sql
                                     if "down_sql" in p_args and p_args["down_sql"]:
                                         last_tool_down_sql = p_args["down_sql"]
                                         if not step_down_sql:

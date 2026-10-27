@@ -153,6 +153,36 @@ class ToolExecutor:
 
             if name == "run_on_clone":
                 up_sql = args.get("up_sql", "")
+                if not up_sql or not up_sql.strip():
+                    return {"error": "up_sql must not be empty."}
+
+                import re
+
+                is_read_query = bool(re.match(r"^\s*(SELECT|PRAGMA|EXPLAIN)\b", up_sql, re.IGNORECASE))
+                if is_read_query:
+                    clone = self.adapter.clone()
+                    try:
+                        cur = clone.cursor()
+                        cur.execute(up_sql)
+                        cols = [d[0] for d in cur.description] if cur.description else []
+                        rows = cur.fetchall()
+                        limit = 10
+                        sample_rows = [
+                            {cols[i]: mask_value(r[i]) for i in range(len(cols))}
+                            for r in rows[:limit]
+                        ]
+                        return {
+                            "status": "query_result",
+                            "note": "Executed read query on sandbox clone.",
+                            "columns": cols,
+                            "count": len(rows),
+                            "sample_rows": sample_rows,
+                        }
+                    except Exception as q_err:
+                        return {"error": f"Query execution error: {q_err}"}
+                    finally:
+                        clone.close()
+
                 base_clone = self.adapter.clone()
                 test_clone = self.adapter.clone()
                 try:

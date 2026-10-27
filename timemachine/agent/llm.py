@@ -28,6 +28,21 @@ STATEMENT_KW_RE = re.compile(
     re.IGNORECASE,
 )
 
+DDL_DML_RE = re.compile(
+    r"\b(CREATE|ALTER|DROP|INSERT|UPDATE|DELETE|REPLACE|TRUNCATE)\b",
+    re.IGNORECASE,
+)
+
+
+def has_ddl_or_dml(sql: str) -> bool:
+    """Check if SQL contains any DDL or DML statements (not just queries or empty checks)."""
+    if not sql:
+        return False
+    s = re.sub(r"--.*$", "", sql, flags=re.MULTILINE)
+    s = re.sub(r"/\*[\s\S]*?\*/", "", s)
+    return bool(DDL_DML_RE.search(s))
+
+
 
 def get_client(api_key_override: str | None = None) -> OpenAI:
     """Build an OpenAI-compatible client for Nebius Token Factory."""
@@ -158,8 +173,9 @@ def call_llm(
             "Rate limit reached (HTTP 429). Please wait a few seconds and retry."
         ) from exc
     except APITimeoutError as exc:
+        timeout_val = int(timeout) if timeout is not None else int(settings.llm_timeout_s)
         raise AgentError(
-            f"Nebius API request timed out ({int(settings.llm_timeout_s)}s). The model service may be experiencing high load."
+            f"Nebius API request timed out ({timeout_val}s). The model service may be experiencing high load."
         ) from exc
     except APIConnectionError as exc:
         raise AgentError(
