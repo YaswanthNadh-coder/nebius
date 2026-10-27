@@ -796,6 +796,61 @@ def test_agent_falls_back_to_last_tool_sql_before_no_sql_abort():
     assert result.status in ("VERIFIED", "UNVERIFIED")
 
 
+def test_agent_preserves_conversation_messages_on_no_sql_retry():
+    """When model returns no SQL after tool execution, retry preserves prior tool messages in context."""
+    adapter = SQLiteAdapter.create_in_memory()
+    conn = adapter.open_readonly()
+    conn.execute("CREATE TABLE employees (id INT PRIMARY KEY, name TEXT);")
+    conn.commit()
+
+    client = MagicMock()
+    client.models.list.return_value.data = [
+        MagicMock(id="nvidia/nemotron-3-super-120b-a12b"),
+        MagicMock(id="nvidia/Nemotron-3-Ultra-550b-a55b"),
+    ]
+
+    spec = MigrationSpec(affected_tables=["employees"], goal="Add notes")
+
+    tc1 = FakeToolCall("get_schema", "{}", "tc1")
+    resp1 = FakeResponse(content=None, tool_calls=[tc1])
+    resp2 = FakeResponse(content="I see the schema.")
+
+    # Retry turn
+    resp3 = FakeResponse(
+        content="```sql\n-- UP MIGRATION\nALTER TABLE employees ADD COLUMN notes TEXT DEFAULT '';\n```"
+    )
+
+    client.chat.completions.create.side_effect = [resp1, resp2, resp3]
+
+    recorded_messages = []
+
+    def mock_create(*args, **kwargs):
+        if "messages" in kwargs:
+            recorded_messages.append(list(kwargs["messages"]))
+        return client.chat.completions.create.side_effect.pop(0)
+
+    client.chat.completions.create = MagicMock(side_effect=[resp1, resp2, resp3])
+
+    with patch("timemachine.agent.loop.get_client", return_value=client):
+        result = run_time_machine_agent(
+            adapter=adapter,
+            goal="Add notes",
+            spec=spec,
+            target_table="employees",
+            api_key_override="test_key_123456",
+            max_steps=2,
+        )
+
+    assert result.status in ("VERIFIED", "UNVERIFIED")
+    # Verify call 3 received multi-turn history with tool response
+    third_call_messages = client.chat.completions.create.call_args_list[2].kwargs["messages"]
+    roles = [m["role"] for m in third_call_messages]
+    assert "tool" in roles
+    assert roles[-1] == "user"
+    assert "no executable migration SQL" in third_call_messages[-1]["content"]
+
+
+
 
 
 

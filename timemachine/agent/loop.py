@@ -98,8 +98,8 @@ def parse_sql_scripts(content: str) -> tuple[str, str]:
     """Parse UP and optional DOWN migration scripts from LLM content without guessing by position."""
     text = content.replace("\r\n", "\n")
 
-    # 1. Split on a line matching ^\s*--\s*(DOWN|ROLLBACK)\b (case-insensitive)
-    down_line_re = re.compile(r"(?im)^\s*--\s*(?:DOWN|ROLLBACK)\b.*$")
+    # 1. Split on a down/rollback line (either plain comment or fence opening with down/rollback comment)
+    down_line_re = re.compile(r"(?im)^\s*(?:```[a-zA-Z0-9_-]*\s*)?--\s*(?:DOWN|ROLLBACK)\b.*$")
     match = down_line_re.search(text)
     if match:
         up_part = text[:match.start()]
@@ -112,7 +112,7 @@ def parse_sql_scripts(content: str) -> tuple[str, str]:
 
     # 2. Check for fenced blocks with down/rollback fence tags or preceding prose labelled down/rollback
     fence_pattern = re.compile(
-        r"(?:^|\n)```([a-zA-Z0-9_-]*)\s*\n(.*?)\n```",
+        r"(?:^|\n)```([^\n]*)\n(.*?)\n```",
         re.DOTALL,
     )
     matches = list(fence_pattern.finditer(text))
@@ -262,7 +262,7 @@ def run_time_machine_agent(
     tool_executor = ToolExecutor(adapter, spec=spec, target_table=target_table)
 
     # Phase 2: Agent Tool/Draft Loop
-    settings = get_settings()
+    settings = get_settings(reload=True)
     wall_clock_budget = settings.agent_wall_clock_timeout_s
     max_tool_rounds = settings.max_tool_rounds_per_step
 
@@ -275,10 +275,12 @@ def run_time_machine_agent(
     consecutive_no_sql = 0
     last_raw_reply = ""
     last_tool_sql = ""
+    last_tool_down_sql = ""
     has_drafted_sql = False
     repeat_feedback: str | None = None
     seen_sql_attempts: dict[str, tuple[int, list[str]]] = {}
     repeat_counts: dict[str, int] = {}
+    messages: list[dict[str, Any]] = []
 
     while step_num < max_steps:
         step_num += 1
@@ -306,20 +308,35 @@ def run_time_machine_agent(
             base_p = build_repair_prompt(schema, spec, sql_to_repair, inv_result, trap_results=traps)
             prompt = f"Your previous reply was {repeat_feedback}.\n\n{base_p}"
             repeat_feedback = None
+            messages = [{"role": "user", "content": prompt}]
         elif inv_result is None:
-            if consecutive_no_sql > 0 and last_raw_reply:
+            if consecutive_no_sql > 0 and messages:
+                notify(f"Re-prompting {current_model} for migration SQL...", {"step": step_num})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Your previous reply contained no executable migration SQL. "
+                        "Based on the database inspection and tool outputs above, please provide "
+                        "the complete SQLite migration script inside ```sql blocks with both UP and DOWN migrations, "
+                        "or call submit."
+                    ),
+                })
+            elif consecutive_no_sql > 0 and last_raw_reply:
                 notify(f"Re-prompting {current_model} for migration SQL...", {"step": step_num})
                 prompt = build_repair_prompt(schema, spec, last_raw_reply, None)
+                messages = [{"role": "user", "content": prompt}]
             else:
                 notify(f"Drafting initial migration using {current_model}...", {"step": step_num})
                 prompt = build_migration_prompt(schema, spec, is_naive_baseline=is_naive_baseline)
+                messages = [{"role": "user", "content": prompt}]
         else:
             notify(f"Escalating repair to {current_model} with structured failure telemetry...", {"step": step_num})
             traps = inv_result.trap_audit if inv_result else []
             sql_to_repair = current_up_sql or last_tool_sql
             prompt = build_repair_prompt(schema, spec, sql_to_repair, inv_result, trap_results=traps)
+            messages = [{"role": "user", "content": prompt}]
 
-        messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+
         step_up_sql = ""
         step_down_sql = ""
         tool_rounds = 0
@@ -437,6 +454,7 @@ def run_time_machine_agent(
                             if isinstance(p_args, dict) and "up_sql" in p_args and p_args["up_sql"]:
                                 last_tool_sql = p_args["up_sql"]
                                 if "down_sql" in p_args and p_args["down_sql"]:
+                                    last_tool_down_sql = p_args["down_sql"]
                                     if not step_down_sql:
                                         step_down_sql = p_args["down_sql"]
                         except Exception:
@@ -526,6 +544,10 @@ def run_time_machine_agent(
                                 p_args = json.loads(fn_args) if isinstance(fn_args, str) else fn_args
                                 if isinstance(p_args, dict) and "up_sql" in p_args and p_args["up_sql"]:
                                     last_tool_sql = p_args["up_sql"]
+                                    if "down_sql" in p_args and p_args["down_sql"]:
+                                        last_tool_down_sql = p_args["down_sql"]
+                                        if not step_down_sql:
+                                            step_down_sql = p_args["down_sql"]
                             except Exception:
                                 pass
             except AgentError as ae:
@@ -548,6 +570,8 @@ def run_time_machine_agent(
             if consecutive_no_sql >= 2:
                 if last_tool_sql and has_ddl_or_dml(last_tool_sql):
                     step_up_sql = last_tool_sql
+                    if not step_down_sql and last_tool_down_sql:
+                        step_down_sql = last_tool_down_sql
                     consecutive_no_sql = 0
                 else:
                     return AgentRunResult(
@@ -570,6 +594,8 @@ def run_time_machine_agent(
 
         consecutive_no_sql = 0
         last_raw_reply = ""
+        last_tool_sql = ""
+        last_tool_down_sql = ""
 
         # Check for repeated SQL / no-progress
         norm_sql = normalize_sql_for_progress(step_up_sql)

@@ -156,17 +156,18 @@ class Settings(BaseModel):
         description="Maximum total wall-clock budget in seconds for an agent execution run",
     )
     max_tool_rounds_per_step: int = Field(
-        default=8,
+        default=10,
         description="Maximum tool calling rounds per step",
     )
+
 
 
 _SETTINGS_INSTANCE: Settings | None = None
 
 
-def get_settings() -> Settings:
+def get_settings(reload: bool = False) -> Settings:
     """Return singleton Settings instance."""
     global _SETTINGS_INSTANCE
-    if _SETTINGS_INSTANCE is None:
+    if _SETTINGS_INSTANCE is None or reload:
         _SETTINGS_INSTANCE = Settings()
     return _SETTINGS_INSTANCE
