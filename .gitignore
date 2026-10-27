@@ -4,3 +4,9 @@ __pycache__/
 .env
 .streamlit/
 .DS_Store
+.timemachine/
+*.db
+*.sqlite
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
