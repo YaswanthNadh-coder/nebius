@@ -85,10 +85,10 @@ TOOL_DEFINITIONS = [
                 "type": "object",
                 "properties": {
                     "up_sql": {"type": "string", "description": "Final forward migration SQL"},
-                    "down_sql": {"type": "string", "description": "Final rollback SQL"},
-                    "notes": {"type": "string", "description": "Explanatory notes and trade-offs"},
+                    "down_sql": {"type": "string", "description": "Final rollback SQL (optional)", "default": ""},
+                    "notes": {"type": "string", "description": "Explanatory notes and trade-offs", "default": ""},
                 },
-                "required": ["up_sql", "down_sql"],
+                "required": ["up_sql"],
             },
         },
     },
@@ -173,6 +173,20 @@ class ToolExecutor:
                         spec=self.spec,
                         elapsed_ms=elapsed,
                     )
+                    try:
+                        from timemachine.traps.generator import audit_traps
+                        traps = audit_traps(test_clone, self.target_table)
+                        inv.trap_audit = traps
+                        failing_traps = [t for t in traps if not t.get("survived")]
+                        if failing_traps:
+                            inv.status = "FAILED"
+                            inv.passed = False
+                            for ft in failing_traps:
+                                inv.failed_checks.append(
+                                    f"ADVERSARIAL_TRAP_FAILED: Trap '{ft.get('trap_type')}' failed ({ft.get('description')})"
+                                )
+                    except Exception:
+                        pass
                     return inv.model_dump()
                 finally:
                     base_clone.close()

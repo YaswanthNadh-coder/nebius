@@ -11,8 +11,6 @@ from hypothesis import strategies as st
 from timemachine.adapters.schema import ColumnInfo, TableSchema
 from timemachine.agent.llm import clean_sql, resolve_nebius_models
 from timemachine.config import (
-    AgentError,
-    get_api_key_info,
     is_placeholder_key,
     load_env_file,
 )
@@ -26,12 +24,9 @@ from timemachine.verify.oracle import (
     split_name_first,
     split_name_last,
     strip_honorific,
-    trim_case,
 )
 from timemachine.verify.sandbox import (
     apply_sandbox,
-    make_sandbox_authorizer,
-    make_sandbox_progress_handler,
 )
 
 # =========================================================================

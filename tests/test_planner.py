@@ -1,9 +1,7 @@
 """Tests for migration planning, spec generation, normalization, and staleness prevention."""
 
 import json
-from unittest.mock import MagicMock, patch
-
-import pytest
+from unittest.mock import MagicMock
 
 from timemachine.adapters.schema import ColumnInfo, DatabaseSchema, TableSchema
 from timemachine.verify.spec import ColumnMapping, MigrationSpec
@@ -172,7 +170,6 @@ def test_generate_spec_failure_returns_error_and_no_spec():
 def test_generate_spec_agent_error_stops_without_retry():
     """An AgentError from call_llm (e.g. 401 auth error) halts immediately with 1 call and preserves error message."""
     from timemachine.agent.planner import generate_spec
-    from timemachine.config import AgentError
 
     client = MagicMock()
     # call_llm will raise AgentError

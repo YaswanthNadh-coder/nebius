@@ -92,7 +92,9 @@ def build_migration_prompt(
         "Requirements:\n"
         "1. Rebuild tables following SQLite standard 12-step table rebuild (create new table, copy data, drop old, rename, recreate indexes/triggers/views).\n"
         "2. Zero silent row drops: Use LEFT JOIN and COALESCE so dirty foreign keys or unmapped codes default safely without losing records.\n"
-        "3. Output BOTH ```sql -- UP MIGRATION ``` and ```sql -- DOWN MIGRATION (ROLLBACK) ```."
+        "3. Output BOTH ```sql -- UP MIGRATION ``` and ```sql -- DOWN MIGRATION (ROLLBACK) ```.\n"
+        "4. You can use available tools (get_schema, profile_table, find_violating_rows, run_on_clone) to inspect data or test candidate fixes on the disposable sandbox clone.\n"
+        "5. When complete, call the submit tool or provide the migration scripts inside ```sql blocks."
     )
     if is_naive_baseline:
         instruction = (
@@ -129,7 +131,7 @@ Target Schema:
 {schema_text}
 your previous reply contained no executable SQL (reply was: {truncated_reply}); reply with the migration.
 
-Output the complete, corrected SQLite migration inside a ```sql ``` block with both UP and DOWN migrations."""
+Output the complete, corrected SQLite migration inside a ```sql ``` block with both UP and DOWN migrations, or call submit."""
 
     failed_checks_text = "\n".join([f"- {fc}" for fc in result.failed_checks])
     traps_text = ""
@@ -163,4 +165,5 @@ Analyze the exact failure points above and write a complete, corrected, lossless
 3. Recreate all pre-existing indexes, views, and triggers.
 4. Provide both UP migration and DOWN rollback migration.
 
-Return the corrected scripts in ```sql blocks."""
+You may use available tools (get_schema, profile_table, find_violating_rows, run_on_clone) to inspect the data or test candidate fixes on the sandbox clone.
+When complete, call the submit tool or return the corrected scripts in ```sql blocks with both UP and DOWN migrations."""

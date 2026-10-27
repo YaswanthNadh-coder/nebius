@@ -156,7 +156,7 @@ class Settings(BaseModel):
         description="Maximum total wall-clock budget in seconds for an agent execution run",
     )
     max_tool_rounds_per_step: int = Field(
-        default=4,
+        default=8,
         description="Maximum tool calling rounds per step",
     )
 

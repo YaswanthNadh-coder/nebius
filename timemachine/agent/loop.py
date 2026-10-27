@@ -83,7 +83,7 @@ def _clean_extracted_block(block: str) -> str:
     t = block.replace("\r\n", "\n")
     t = re.sub(r"<think>.*?</think>", "", t, flags=re.DOTALL)
     t = re.sub(r"<think>.*", "", t, flags=re.DOTALL)
-    t = re.sub(r"^```[a-zA-Z0-9_-]*\s*$", "", t, flags=re.MULTILINE)
+    t = re.sub(r"^```.*$", "", t, flags=re.MULTILINE)
     return t.strip()
 
 
@@ -436,6 +436,9 @@ def run_time_machine_agent(
                             p_args = json.loads(fn_args) if isinstance(fn_args, str) else fn_args
                             if isinstance(p_args, dict) and "up_sql" in p_args and p_args["up_sql"]:
                                 last_tool_sql = p_args["up_sql"]
+                                if "down_sql" in p_args and p_args["down_sql"]:
+                                    if not step_down_sql:
+                                        step_down_sql = p_args["down_sql"]
                         except Exception:
                             pass
 
@@ -452,7 +455,81 @@ def run_time_machine_agent(
                 if step_up_sql:
                     break
             else:
+                messages.append({"role": "assistant", "content": content})
                 break
+
+        # If tool rounds budget was exhausted after tool calls and no SQL produced yet,
+        # prompt model once more so it can inspect tool outputs and deliver final SQL or submit.
+        if not step_up_sql and messages and messages[-1].get("role") == "tool":
+            remaining_s = max(1.0, wall_clock_budget - (time.time() - start_time))
+            step_start = time.time()
+            final_reminder = {
+                "role": "user",
+                "content": (
+                    "Tool round budget reached. Please now provide the final SQLite migration script "
+                    "with both UP and DOWN migrations inside ```sql blocks, or call submit."
+                ),
+            }
+            messages.append(final_reminder)
+            try:
+                raw_msg, usage = call_llm(
+                    client,
+                    current_model,
+                    messages=messages,
+                    temperature=0.2,
+                    tools=TOOL_DEFINITIONS,
+                    timeout=min(remaining_s, settings.llm_timeout_s),
+                )
+                last_step_lat = (time.time() - step_start) * 1000
+                step_usage = usage
+                if usage and hasattr(usage, "total_tokens"):
+                    total_tokens += usage.total_tokens
+
+                content = raw_msg.content or ""
+                tool_calls = getattr(raw_msg, "tool_calls", None)
+
+                if content:
+                    extracted_up, extracted_down = parse_sql_scripts(content)
+                    if extracted_up:
+                        step_up_sql = extracted_up
+                        step_down_sql = extracted_down
+
+                if tool_calls:
+                    for tc in tool_calls:
+                        fn_obj = getattr(tc, "function", None)
+                        fn_name = getattr(fn_obj, "name", "")
+                        fn_args = getattr(fn_obj, "arguments", "")
+                        if not isinstance(fn_args, str):
+                            fn_args = json.dumps(fn_args)
+                        res = tool_executor.execute(fn_name, fn_args)
+                        steps.append(
+                            AgentStepLog(
+                                step=len(steps) + 1,
+                                model=current_model,
+                                action=f"tool:{fn_name}",
+                                details={
+                                    "raw_reply": content[:500] if content else "",
+                                    "args": fn_args,
+                                    "result": res,
+                                },
+                                tokens_used=getattr(usage, "total_tokens", 0) if usage else 0,
+                                latency_ms=last_step_lat,
+                                status="ok" if "error" not in res else "error",
+                            )
+                        )
+                        if fn_name == "submit":
+                            step_up_sql = res.get("up_sql", "")
+                            step_down_sql = res.get("down_sql", "")
+                            notes = res.get("notes", "")
+                        elif fn_name == "run_on_clone":
+                            try:
+                                p_args = json.loads(fn_args) if isinstance(fn_args, str) else fn_args
+                                if isinstance(p_args, dict) and "up_sql" in p_args and p_args["up_sql"]:
+                                    last_tool_sql = p_args["up_sql"]
+                            except Exception:
+                                pass
+            except AgentError as ae:
+                logger.warning(f"Final tool completion call failed: {ae}")
 
         if not step_up_sql:
             last_raw_reply = content
@@ -469,22 +546,27 @@ def run_time_machine_agent(
                 )
             )
             if consecutive_no_sql >= 2:
-                return AgentRunResult(
-                    status="FAILED",
-                    up_sql=current_up_sql,
-                    down_sql=current_down_sql,
-                    spec=spec,
-                    steps=steps,
-                    invariant_result=inv_result,
-                    total_tokens=total_tokens,
-                    total_latency_ms=(time.time() - start_time) * 1000,
-                    stop_reason="MODEL_RETURNED_NO_SQL",
-                    fast_model=fast_model,
-                    ultra_model=ultra_model,
-                    model_warnings=warnings,
-                )
-            logger.warning("Model produced empty SQL; retrying...")
-            continue
+                if last_tool_sql and has_ddl_or_dml(last_tool_sql):
+                    step_up_sql = last_tool_sql
+                    consecutive_no_sql = 0
+                else:
+                    return AgentRunResult(
+                        status="FAILED",
+                        up_sql=current_up_sql,
+                        down_sql=current_down_sql,
+                        spec=spec,
+                        steps=steps,
+                        invariant_result=inv_result,
+                        total_tokens=total_tokens,
+                        total_latency_ms=(time.time() - start_time) * 1000,
+                        stop_reason="MODEL_RETURNED_NO_SQL",
+                        fast_model=fast_model,
+                        ultra_model=ultra_model,
+                        model_warnings=warnings,
+                    )
+            if not step_up_sql:
+                logger.warning("Model produced empty SQL; retrying...")
+                continue
 
         consecutive_no_sql = 0
         last_raw_reply = ""

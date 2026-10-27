@@ -227,9 +227,9 @@ def clean_sql(raw_text: str | None) -> str:
     if not text:
         return ""
 
-    # Line-anchored fence regex matching sql, sqlite, or untagged
+    # Line-anchored fence regex matching sql, sqlite, or untagged (with optional comments)
     fence_re = re.compile(
-        r"^```(?:sql|sqlite)?\s*$\n(.*?)^```\s*$",
+        r"^```(?:sql|sqlite)?.*$\n(.*?)^```\s*$",
         re.MULTILINE | re.DOTALL | re.IGNORECASE,
     )
     blocks = fence_re.findall(text)
@@ -239,7 +239,7 @@ def clean_sql(raw_text: str | None) -> str:
             return "\n\n".join(valid_blocks)
 
     # Handle unterminated fence opening
-    open_fence = re.compile(r"^```(?:sql|sqlite)?\s*$", re.MULTILINE | re.IGNORECASE)
+    open_fence = re.compile(r"^```(?:sql|sqlite)?.*$", re.MULTILINE | re.IGNORECASE)
     if open_fence.search(text):
         text = open_fence.sub("", text).strip()
 

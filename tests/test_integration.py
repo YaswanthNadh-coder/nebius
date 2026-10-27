@@ -1,7 +1,6 @@
 """Integration tests on a real SQLite fixture with foreign keys, indexes, views, and triggers."""
 
 import hashlib
-import os
 import sqlite3
 
 import pytest
