@@ -52,6 +52,31 @@ def test_app_results_persist_across_widget_changes():
 
 def test_app_run_dry_run_simulation(monkeypatch):
     """Verify that clicking Start Autonomous Dry-Run Time Machine executes cleanly without system error."""
+    monkeypatch.setenv("NEBIUS_API_KEY", "test_key_fake_123456")
+    monkeypatch.setenv("NEBIUS_FAST_MODEL", "nvidia/nemotron-3-super-120b-a12b")
+    monkeypatch.setenv("NEBIUS_ULTRA_MODEL", "nvidia/Nemotron-3-Ultra-550b-a55b")
+
+    class FakeMessage:
+        def __init__(self, content=None, tool_calls=None):
+            self.content = content
+            self.tool_calls = tool_calls
+
+    class FakeChoice:
+        def __init__(self, content=None, tool_calls=None):
+            self.message = FakeMessage(content, tool_calls)
+            self.finish_reason = "stop"
+
+    class FakeResponse:
+        def __init__(self, content=None, tool_calls=None):
+            self.choices = [FakeChoice(content, tool_calls)]
+            self.usage = None
+
+    def fake_create(self, *args, **kwargs):
+        return FakeResponse(content="```sql\nALTER TABLE employees ADD COLUMN test_col TEXT DEFAULT 'ok';\n```")
+
+    import openai.resources.chat.completions
+    monkeypatch.setattr(openai.resources.chat.completions.Completions, "create", fake_create)
+
     app_path = os.path.abspath("app.py")
     at = AppTest.from_file(app_path, default_timeout=15.0).run()
 
@@ -62,14 +87,6 @@ def test_app_run_dry_run_simulation(monkeypatch):
     at.session_state["spec_approved"] = True
     at.session_state["inject_traps"] = True
     at.run()
-
-    # Mock call_llm so dry run completes with clean SQL
-    import timemachine.agent.loop as agent_loop
-
-    def fake_call_llm(client, model, prompt, **kwargs):
-        return ("ALTER TABLE employees ADD COLUMN test_col TEXT DEFAULT 'ok';", None)
-
-    monkeypatch.setattr(agent_loop, "call_llm", fake_call_llm)
 
     # Find the Start Autonomous Dry-Run Time Machine button (may be in tabs[2] or global at.button)
     all_buttons = list(at.button)
@@ -88,3 +105,193 @@ def test_app_run_dry_run_simulation(monkeypatch):
     assert not any("Unexpected Execution Error" in t for t in error_texts), f"Found Unexpected Execution Error: {error_texts}"
     assert at.session_state.get("run_result") is not None
     assert at.session_state["run_result"].status in ("VERIFIED", "UNVERIFIED")
+
+
+def test_app_create_spec_approve_and_run_later(monkeypatch):
+    """AppTest creates a spec in one run, approves it, and clicks Run in a LATER run."""
+    import json
+    monkeypatch.setenv("NEBIUS_API_KEY", "test_key_fake_123456")
+    monkeypatch.setenv("NEBIUS_FAST_MODEL", "nvidia/nemotron-3-super-120b-a12b")
+    monkeypatch.setenv("NEBIUS_ULTRA_MODEL", "nvidia/Nemotron-3-Ultra-550b-a55b")
+
+    class FakeMessage:
+        def __init__(self, content=None, tool_calls=None):
+            self.content = content
+            self.tool_calls = tool_calls
+
+    class FakeChoice:
+        def __init__(self, content=None, tool_calls=None):
+            self.message = FakeMessage(content, tool_calls)
+            self.finish_reason = "stop"
+
+    class FakeResponse:
+        def __init__(self, content=None, tool_calls=None):
+            self.choices = [FakeChoice(content, tool_calls)]
+            self.usage = None
+
+    valid_spec_json = json.dumps({
+        "goal": "Normalize department",
+        "affected_tables": ["employees"],
+    })
+
+    def fake_create(self, messages, **kwargs):
+        user_msg = messages[-1]["content"] if messages else ""
+        if "Target JSON Schema" in user_msg or "output a structured MigrationSpec JSON" in user_msg:
+            return FakeResponse(content=f"```json\n{valid_spec_json}\n```")
+        return FakeResponse(content="```sql\nALTER TABLE employees ADD COLUMN test_col TEXT DEFAULT 'ok';\n```")
+
+    import openai.resources.chat.completions
+    monkeypatch.setattr(openai.resources.chat.completions.Completions, "create", fake_create)
+
+    app_path = os.path.abspath("app.py")
+    at = AppTest.from_file(app_path, default_timeout=15.0).run()
+
+    # Step 1: Click "Generate Migration Spec"
+    all_buttons = list(at.button)
+    if len(at.tabs) > 1:
+        all_buttons.extend(list(at.tabs[1].button))
+    gen_btn = next((b for b in all_buttons if "Generate Migration Spec" in b.label), None)
+    assert gen_btn is not None
+    gen_btn.click().run()
+
+    assert not at.exception
+    assert at.session_state.get("spec") is not None
+
+    # Step 2: Approve the spec in a subsequent run
+    all_cbs = list(at.checkbox)
+    if len(at.tabs) > 1:
+        all_cbs.extend(list(at.tabs[1].checkbox))
+    appr_cb = next((c for c in all_cbs if "approve this MigrationSpec" in c.label), None)
+    assert appr_cb is not None
+    appr_cb.check().run()
+    assert at.session_state.get("spec_approved") is True
+
+    # Step 3: Click Run in a LATER run
+    all_run_buttons = list(at.button)
+    if len(at.tabs) > 2:
+        all_run_buttons.extend(list(at.tabs[2].button))
+    run_btn = next((b for b in all_run_buttons if "Start Autonomous Dry-Run" in b.label), None)
+    assert run_btn is not None
+    assert not run_btn.disabled
+    run_btn.click().run()
+
+    assert not at.exception
+    error_texts = [e.value for e in at.error]
+    assert len(error_texts) == 0, f"Unexpected st.error in app: {error_texts}"
+    assert at.session_state.get("run_result") is not None
+    assert at.session_state["run_result"].status in ("VERIFIED", "UNVERIFIED")
+
+
+def test_app_switching_scenario_clears_spec():
+    """Switching database scenario in Connect tab clears spec, spec_approved, and run_result."""
+    app_path = os.path.abspath("app.py")
+    at = AppTest.from_file(app_path, default_timeout=15.0).run()
+
+    from timemachine.verify.spec import MigrationSpec
+    at.session_state["spec"] = MigrationSpec(affected_tables=["employees"], goal="old goal")
+    at.session_state["spec_approved"] = True
+    at.run()
+
+    # Switch radio to Scenario 2
+    radios = list(at.radio)
+    if len(at.tabs) > 0:
+        radios.extend(list(at.tabs[0].radio))
+    src_radio = next((r for r in radios if "Select Database Source" in r.label), None)
+    assert src_radio is not None
+    src_radio.set_value("Built-in Scenario: Salary Banding").run()
+
+    assert at.session_state.get("spec") is None
+    assert at.session_state.get("spec_approved") is False
+    assert at.session_state.get("run_result") is None
+
+
+def test_app_failed_generation_leaves_no_stale_spec(monkeypatch):
+    """When spec generation fails, session_state['spec'] is cleared, not showing stale spec."""
+    monkeypatch.setenv("NEBIUS_API_KEY", "test_key_fake_123456")
+    monkeypatch.setenv("NEBIUS_FAST_MODEL", "nvidia/nemotron-3-super-120b-a12b")
+    monkeypatch.setenv("NEBIUS_ULTRA_MODEL", "nvidia/Nemotron-3-Ultra-550b-a55b")
+
+    class FakeChoice:
+        def __init__(self):
+            self.message = type("Msg", (), {"content": "not json at all", "tool_calls": None})()
+            self.finish_reason = "stop"
+
+    class FakeResponse:
+        def __init__(self):
+            self.choices = [FakeChoice()]
+            self.usage = None
+
+    import openai.resources.chat.completions
+    monkeypatch.setattr(openai.resources.chat.completions.Completions, "create", lambda self, *args, **kwargs: FakeResponse())
+
+    app_path = os.path.abspath("app.py")
+    at = AppTest.from_file(app_path, default_timeout=15.0).run()
+
+    from timemachine.verify.spec import MigrationSpec
+    at.session_state["spec"] = MigrationSpec(affected_tables=["employees"], goal="stale goal")
+    at.run()
+
+    all_buttons = list(at.button)
+    if len(at.tabs) > 1:
+        all_buttons.extend(list(at.tabs[1].button))
+    gen_btn = next((b for b in all_buttons if "Generate Migration Spec" in b.label), None)
+    assert gen_btn is not None
+    gen_btn.click().run()
+
+    # Spec must be None after failure
+    assert at.session_state.get("spec") is None
+    assert len(at.error) > 0
+
+
+def test_app_run_dry_run_with_naive_baseline_checked(monkeypatch):
+    """Verify that clicking Start Autonomous Dry-Run with naive baseline checkbox ON executes cleanly."""
+    monkeypatch.setenv("NEBIUS_API_KEY", "test_key_fake_123456")
+    monkeypatch.setenv("NEBIUS_FAST_MODEL", "nvidia/nemotron-3-super-120b-a12b")
+    monkeypatch.setenv("NEBIUS_ULTRA_MODEL", "nvidia/Nemotron-3-Ultra-550b-a55b")
+
+    class FakeMessage:
+        def __init__(self, content=None, tool_calls=None):
+            self.content = content
+            self.tool_calls = tool_calls
+
+    class FakeChoice:
+        def __init__(self, content=None, tool_calls=None):
+            self.message = FakeMessage(content, tool_calls)
+            self.finish_reason = "stop"
+
+    class FakeResponse:
+        def __init__(self, content=None, tool_calls=None):
+            self.choices = [FakeChoice(content, tool_calls)]
+            self.usage = None
+
+    def fake_create(self, *args, **kwargs):
+        return FakeResponse(content="```sql\nALTER TABLE employees ADD COLUMN test_col TEXT DEFAULT 'ok';\n```")
+
+    import openai.resources.chat.completions
+    monkeypatch.setattr(openai.resources.chat.completions.Completions, "create", fake_create)
+
+    app_path = os.path.abspath("app.py")
+    at = AppTest.from_file(app_path, default_timeout=15.0).run()
+
+    from timemachine.verify.spec import MigrationSpec
+
+    at.session_state["spec"] = MigrationSpec(affected_tables=["employees"], goal="test")
+    at.session_state["spec_approved"] = True
+    at.session_state["is_naive_baseline"] = True
+    at.run()
+
+    all_buttons = list(at.button)
+    if len(at.tabs) > 2:
+        all_buttons.extend(list(at.tabs[2].button))
+
+    run_btn = next((b for b in all_buttons if "Start Autonomous Dry-Run" in b.label), None)
+    assert run_btn is not None
+    run_btn.click().run()
+
+    assert not at.exception
+    error_texts = [e.value for e in at.error]
+    assert not any("Unexpected Execution Error" in t for t in error_texts)
+    assert at.session_state.get("run_result") is not None
+    assert at.session_state["run_result"].status in ("VERIFIED", "UNVERIFIED", "FAILED")
+
+

@@ -2,8 +2,16 @@
 
 import os
 import re
+from typing import Any
 
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AuthenticationError,
+    OpenAI,
+    RateLimitError,
+)
 
 from timemachine.config import (
     AgentError,
@@ -109,45 +117,81 @@ def resolve_nebius_models(client: OpenAI) -> tuple[str, str, list[str]]:
 def call_llm(
     client: OpenAI,
     model: str,
-    prompt: str,
+    prompt: str | None = None,
     temperature: float = 0.2,
     max_tokens: int | None = None,
     tools: list[dict] | None = None,
-) -> tuple[str, list[dict] | None]:
+    messages: list[dict] | None = None,
+    timeout: float | None = None,
+) -> tuple[Any, Any]:
     """Execute LLM call with complete error translation and finish_reason handling.
 
-    Returns: (text_content, tool_calls_list).
+    Returns: (raw_assistant_message, usage_obj).
     """
     settings = get_settings()
     tokens = max_tokens or settings.max_llm_tokens
 
-    kwargs: dict = {
+    if messages is not None:
+        call_messages = list(messages)
+    else:
+        call_messages = [{"role": "user", "content": prompt or ""}]
+
+    kwargs: dict[str, Any] = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": call_messages,
         "temperature": temperature,
         "max_tokens": tokens,
     }
     if tools:
         kwargs["tools"] = tools
+    if timeout is not None:
+        kwargs["timeout"] = timeout
 
     try:
         resp = client.chat.completions.create(**kwargs)
-    except Exception as exc:
-        name = type(exc).__name__
-        msg = str(exc)
-        if "401" in msg or "unauthorized" in msg.lower():
+    except AuthenticationError as exc:
+        raise AgentError(
+            "Authentication failed (HTTP 401). Check that your NEBIUS_API_KEY is active and valid."
+        ) from exc
+    except RateLimitError as exc:
+        raise AgentError(
+            "Rate limit reached (HTTP 429). Please wait a few seconds and retry."
+        ) from exc
+    except APITimeoutError as exc:
+        raise AgentError(
+            f"Nebius API request timed out ({int(settings.llm_timeout_s)}s). The model service may be experiencing high load."
+        ) from exc
+    except APIConnectionError as exc:
+        raise AgentError(
+            "Unable to connect to Nebius Token Factory. Please check your network connection."
+        ) from exc
+    except APIStatusError as exc:
+        if exc.status_code == 401:
             raise AgentError(
                 "Authentication failed (HTTP 401). Check that your NEBIUS_API_KEY is active and valid."
             ) from exc
-        if "429" in msg or "rate" in msg.lower():
+        if exc.status_code == 429:
+            raise AgentError(
+                "Rate limit reached (HTTP 429). Please wait a few seconds and retry."
+            ) from exc
+        raise AgentError(f"API Error ({type(exc).__name__}): {exc.message}") from exc
+    except Exception as exc:
+        name = type(exc).__name__
+        msg = str(exc)
+        status_code = getattr(exc, "status_code", None)
+        if status_code == 401 or re.search(r"\b401\b", msg) or "unauthorized" in msg.lower():
+            raise AgentError(
+                "Authentication failed (HTTP 401). Check that your NEBIUS_API_KEY is active and valid."
+            ) from exc
+        if status_code == 429 or re.search(r"\b429\b", msg) or re.search(r"\brate\s*limit\b", msg.lower()):
             raise AgentError(
                 "Rate limit reached (HTTP 429). Please wait a few seconds and retry."
             ) from exc
         if "timeout" in name.lower() or "timeout" in msg.lower():
             raise AgentError(
-                "Nebius API request timed out (90s). The model service may be experiencing high load."
+                f"Nebius API request timed out ({int(settings.llm_timeout_s)}s). The model service may be experiencing high load."
             ) from exc
-        if "connect" in name.lower() or "connect" in msg.lower():
+        if "connection" in name.lower() or "connect" in msg.lower():
             raise AgentError(
                 "Unable to connect to Nebius Token Factory. Please check your network connection."
             ) from exc
@@ -159,25 +203,7 @@ def call_llm(
             "Model output was truncated (max_tokens limit reached). Try breaking down the migration goal."
         )
 
-    # Safely extract message content and tool calls
-    msg_obj = choice.message
-    content = msg_obj.content or ""
-
-    tool_calls = None
-    if getattr(msg_obj, "tool_calls", None):
-        tool_calls = [
-            {
-                "id": tc.id,
-                "type": tc.type,
-                "function": {
-                    "name": tc.function.name,
-                    "arguments": tc.function.arguments,
-                },
-            }
-            for tc in msg_obj.tool_calls
-        ]
-
-    return content, tool_calls
+    return choice.message, getattr(resp, "usage", None)
 
 
 def clean_sql(raw_text: str | None) -> str:

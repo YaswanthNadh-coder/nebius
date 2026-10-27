@@ -1,6 +1,6 @@
 """Streamlit UI view rendering the 5-tab autonomous migration time machine."""
 
-import json
+import hashlib
 import os
 
 import streamlit as st
@@ -8,6 +8,7 @@ import streamlit as st
 from timemachine.adapters.sqlite import SQLiteAdapter
 from timemachine.agent.llm import get_client, resolve_nebius_models
 from timemachine.agent.loop import AgentRunResult, run_time_machine_agent
+from timemachine.agent.planner import generate_spec
 from timemachine.config import (
     AgentError,
     get_api_key_info,
@@ -21,7 +22,7 @@ from timemachine.report.writer import (
     generate_markdown_report,
     wrap_transaction_with_prechecks,
 )
-from timemachine.traps.profiler import mask_value
+from timemachine.traps.profiler import mask_value, profile_database
 from timemachine.verify.spec import MigrationSpec
 
 logger = get_logger("ui.app_view")
@@ -36,6 +37,10 @@ def init_session_state():
         "goal": "Normalize department into a separate departments table and split full_name into first_name and last_name.",
         "spec": None,
         "spec_approved": False,
+        "spec_source": "",
+        "spec_model": "",
+        "spec_latency_ms": 0.0,
+        "spec_goal_hash": "",
         "run_result": None,
         "is_naive_baseline": False,
         "fk_enabled": True,
@@ -202,6 +207,9 @@ def render_connect_tab():
             st.session_state["adapter_name"] = "Scenario 1"
             st.session_state["target_table"] = "employees"
             st.session_state["goal"] = "Normalize department into a separate departments table and split full_name into first_name and last_name."
+            st.session_state["spec"] = None
+            st.session_state["spec_approved"] = False
+            st.session_state["run_result"] = None
 
     elif source_type == "Built-in Scenario: Salary Banding":
         if st.session_state.get("adapter_name") != "Scenario 2" or st.session_state.get("adapter") is None:
@@ -209,6 +217,9 @@ def render_connect_tab():
             st.session_state["adapter_name"] = "Scenario 2"
             st.session_state["target_table"] = "employees"
             st.session_state["goal"] = "Clean raw_salary by converting string amounts ($120,000) to integer cents in salary_cents, and compute salary_band."
+            st.session_state["spec"] = None
+            st.session_state["spec_approved"] = False
+            st.session_state["run_result"] = None
 
     elif source_type == "Upload .sqlite / .db File":
         uploaded = st.file_uploader("Upload SQLite database (.sqlite, .db)", type=["sqlite", "db", "sqlite3"])
@@ -217,6 +228,9 @@ def render_connect_tab():
             adapter = SQLiteAdapter.from_bytes(raw_bytes)
             st.session_state["adapter"] = adapter
             st.session_state["adapter_name"] = uploaded.name
+            st.session_state["spec"] = None
+            st.session_state["spec_approved"] = False
+            st.session_state["run_result"] = None
             st.success(f"Loaded '{uploaded.name}' ({len(raw_bytes) / 1024:.1f} KB) into isolated sandbox memory.")
 
     elif source_type == "Upload .sql Dump Script":
@@ -226,6 +240,9 @@ def render_connect_tab():
             adapter = SQLiteAdapter.from_sql_dump(dump_str)
             st.session_state["adapter"] = adapter
             st.session_state["adapter_name"] = uploaded_sql.name
+            st.session_state["spec"] = None
+            st.session_state["spec_approved"] = False
+            st.session_state["run_result"] = None
             st.success(f"Executed dump '{uploaded_sql.name}' into sandbox memory.")
 
     elif source_type == "Local Database Filepath":
@@ -235,6 +252,9 @@ def render_connect_tab():
                 adapter = SQLiteAdapter.from_file(local_path)
                 st.session_state["adapter"] = adapter
                 st.session_state["adapter_name"] = os.path.basename(local_path)
+                st.session_state["spec"] = None
+                st.session_state["spec_approved"] = False
+                st.session_state["run_result"] = None
                 st.success(f"Connected to '{local_path}' in read-only mode.")
 
     adapter = st.session_state.get("adapter")
@@ -249,12 +269,17 @@ def render_connect_tab():
 
         col1, col2 = st.columns([1, 2])
         with col1:
+            prev_target = st.session_state.get("target_table")
             target_table = st.selectbox(
                 "Primary Migration Target Table",
                 t_names,
-                index=t_names.index(st.session_state.get("target_table")) if st.session_state.get("target_table") in t_names else 0,
+                index=t_names.index(prev_target) if prev_target in t_names else 0,
             )
-            st.session_state["target_table"] = target_table
+            if target_table != prev_target:
+                st.session_state["target_table"] = target_table
+                st.session_state["spec"] = None
+                st.session_state["spec_approved"] = False
+                st.session_state["run_result"] = None
 
         with col2:
             tbl_info = schema.get_table(target_table)
@@ -315,41 +340,78 @@ def render_plan_tab():
         height=90,
         help="Describe what schema transformation should occur.",
     )
-    st.session_state["goal"] = goal_input
+    if goal_input != st.session_state.get("goal"):
+        st.session_state["goal"] = goal_input
+        st.session_state["spec"] = None
+        st.session_state["spec_approved"] = False
+        st.session_state["run_result"] = None
 
     col1, col2 = st.columns([1, 1])
+    generate_clicked = False
     with col1:
         if st.button("🤖 Generate Migration Spec (Nemotron Super)", width="stretch"):
-            with st.spinner("Analyzing schema and drafting MigrationSpec..."):
+            generate_clicked = True
+    with col2:
+        if st.session_state.get("spec") is not None:
+            if st.button("🔄 Regenerate Migration Spec", width="stretch"):
+                generate_clicked = True
+
+    if generate_clicked:
+        with st.spinner("Analyzing schema and drafting MigrationSpec..."):
+            try:
+                clean_key, _, _ = get_api_key_info(st.session_state.get("api_key_override"))
+                client = get_client(clean_key)
+                fast, _, warns = resolve_nebius_models(client)
+                for w in warns:
+                    st.warning(w)
+
+                schema = adapter.introspect()
+                clone = adapter.clone()
                 try:
-                    clean_key, _, _ = get_api_key_info(st.session_state.get("api_key_override"))
-                    client = get_client(clean_key)
-                    fast, _, _ = resolve_nebius_models(client)
-                    from timemachine.agent.llm import call_llm
-                    from timemachine.agent.prompts import build_plan_prompt
+                    profiles = profile_database(clone, schema)
+                except Exception as p_exc:
+                    logger.debug(f"Could not compute profiles: {p_exc}")
+                    profiles = {}
+                finally:
+                    clone.close()
 
-                    schema = adapter.introspect()
-                    prompt = build_plan_prompt(schema, goal_input)
-                    content, _ = call_llm(client, fast, prompt, temperature=0.1)
+                target_t = st.session_state.get("target_table", "employees")
+                spec_res = generate_spec(
+                    client=client,
+                    model=fast,
+                    schema=schema,
+                    goal=goal_input,
+                    profiles=profiles,
+                    target_table=target_t,
+                )
 
-                    cleaned = content.strip()
-                    if "```json" in cleaned:
-                        cleaned = cleaned.split("```json")[1].split("```")[0].strip()
-                    elif "```" in cleaned:
-                        cleaned = cleaned.split("```")[1].split("```")[0].strip()
-
-                    spec_dict = json.loads(cleaned)
-                    spec = MigrationSpec.model_validate(spec_dict)
-                    st.session_state["spec"] = spec
+                if spec_res.spec is not None:
+                    st.session_state["spec"] = spec_res.spec
                     st.session_state["spec_approved"] = False
+                    st.session_state["spec_source"] = spec_res.source
+                    st.session_state["spec_model"] = spec_res.model
+                    st.session_state["spec_latency_ms"] = spec_res.latency_ms
+                    st.session_state["spec_goal_hash"] = hashlib.sha256(goal_input.encode()).hexdigest()[:8]
                     st.success("MigrationSpec generated successfully!")
-                except Exception as exc:
-                    st.error(f"Failed to generate spec: {exc}")
+                else:
+                    st.session_state["spec"] = None
+                    st.session_state["spec_approved"] = False
+                    st.error(f"Failed to generate spec: {spec_res.error}")
+            except Exception as exc:
+                st.session_state["spec"] = None
+                st.session_state["spec_approved"] = False
+                st.error(f"Failed to generate spec: {exc}")
 
     spec: MigrationSpec | None = st.session_state.get("spec")
     if spec:
         st.subheader("📋 Generated MigrationSpec (JSON)")
         st.json(spec.model_dump())
+
+        src = st.session_state.get("spec_source", "model")
+        mdl = st.session_state.get("spec_model", "nemotron")
+        lat = st.session_state.get("spec_latency_ms", 0.0)
+        ghash = st.session_state.get("spec_goal_hash", "")
+        st.caption(f"**Source**: `{src}` | **Model**: `{mdl}` | **Time**: `{round(lat)}ms` | **Goal Hash**: `{ghash}`")
 
         st.markdown("### User Approval Gate")
         approved = st.checkbox(
@@ -436,6 +498,9 @@ def render_run_tab():
     # Display results if available in session_state
     res: AgentRunResult | None = st.session_state.get("run_result")
     if res:
+        if res.model_warnings:
+            for w in res.model_warnings:
+                st.warning(w)
         st.subheader("Step-by-Step Execution Trace")
         for s in res.steps:
             with st.expander(f"Step {s.step}: [{s.model}] `{s.action}` ({round(s.latency_ms)}ms)"):

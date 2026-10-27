@@ -1,8 +1,25 @@
 """Migration specification schema and validation."""
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
+
+TransformType = Literal[
+    "passthrough",
+    "split_name_first",
+    "split_name_last",
+    "strip_honorific",
+    "cast_int",
+    "cast_cents",
+    "default_if_null",
+    "map_via_lookup",
+    "normalize_date",
+    "salary_band",
+    "trim",
+    "lower",
+    "upper",
+    "custom",
+]
 
 
 class ColumnMapping(BaseModel):
@@ -10,7 +27,7 @@ class ColumnMapping(BaseModel):
 
     new_column: str
     source_column: str | None = None
-    transform: str = "passthrough"  # passthrough, split_name_first, split_name_last, cast_int, default_if_null, map_via_lookup, etc.
+    transform: TransformType = "passthrough"
     null_policy: str = "not_null"   # not_null, nullable
     default_value: Any | None = None
     lookup_table: str | None = None

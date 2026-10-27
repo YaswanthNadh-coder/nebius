@@ -4,7 +4,6 @@ import sqlite3
 
 import pytest
 
-from agent import create_dirty_production_snapshot, verify_migration_on_clone
 from timemachine.adapters.sqlite import SQLiteAdapter
 from timemachine.verify.invariants import evaluate_migration_invariants
 from timemachine.verify.rebuild import verify_rollback_roundtrip

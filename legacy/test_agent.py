@@ -9,8 +9,12 @@ if hasattr(sys.stdout, "reconfigure"):
     except Exception:
         pass
 
-from agent import get_client, resolve_nebius_models, run_time_machine_agent
-from scenarios import SCENARIOS
+try:
+    from legacy.agent import get_client, resolve_nebius_models, run_time_machine_agent
+    from legacy.scenarios import SCENARIOS
+except ImportError:
+    from agent import get_client, resolve_nebius_models, run_time_machine_agent
+    from scenarios import SCENARIOS
 from timemachine.config import get_api_key_info, is_placeholder_key, load_env_file
 
 load_env_file()

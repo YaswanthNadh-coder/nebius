@@ -116,11 +116,21 @@ def build_repair_prompt(
     schema: DatabaseSchema,
     spec: MigrationSpec,
     failed_sql: str,
-    result: InvariantResult,
+    result: InvariantResult | None = None,
     trap_results: list[dict] | None = None,
 ) -> str:
     """Build repair prompt with structured failure telemetry."""
     schema_text = format_schema_summary(schema)
+    if result is None:
+        truncated_reply = (failed_sql or "")[:500]
+        return f"""You are a database migration engineer writing SQLite migration SQL.
+
+Target Schema:
+{schema_text}
+your previous reply contained no executable SQL (reply was: {truncated_reply}); reply with the migration.
+
+Output the complete, corrected SQLite migration inside a ```sql ``` block with both UP and DOWN migrations."""
+
     failed_checks_text = "\n".join([f"- {fc}" for fc in result.failed_checks])
     traps_text = ""
     if trap_results:

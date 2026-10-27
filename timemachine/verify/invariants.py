@@ -18,8 +18,8 @@ logger = get_logger("verify.invariants")
 class InvariantResult(BaseModel):
     """Result of invariant evaluation."""
 
-    status: str = "VERIFIED"  # VERIFIED, UNVERIFIED, FAILED
-    passed: bool = True
+    status: str = "FAILED"  # VERIFIED, UNVERIFIED, FAILED
+    passed: bool = False
     error: str | None = None
     before_count: int = 0
     after_count: int | None = None

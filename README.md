@@ -46,7 +46,7 @@ The **SQL Migration Time Machine** is an autonomous, tool-using agent that conne
 │   • Model Drafting: NVIDIA Nemotron-3-Super (120b)                │
 │   • Model Escalation: NVIDIA Nemotron-3-Ultra (550b)              │
 │   • Tools: get_schema, profile_table, run_on_clone, explain       │
-│   • In-Memory Sandbox Clone (Sub-5ms, Authorizer + 2s Deadline)   │
+│   • In-Memory Sandbox Clone (High-Speed RAM clone, Authorizer + 2s Deadline) │
 └─────────────────────────────────┬─────────────────────────────────┘
                                   │
                                   ▼
@@ -151,8 +151,9 @@ streamlit run app.py
 
 ### 6. (Optional) Run CLI Smoke Test
 ```bash
-python test_agent.py
+python legacy/test_agent.py
 ```
+> **Note:** Legacy single-file scripts (`agent.py`, `scenarios.py`, `test_agent.py`) have been moved to `legacy/`. The production system runs via `streamlit run app.py` and the `timemachine/` package.
 
 ---
 
@@ -237,7 +238,7 @@ python evals/run_evals.py
 - **Inference Provider:** [Nebius Token Factory](https://tokenfactory.nebius.com/) (`https://api.tokenfactory.nebius.com/v1/`)
 - **Fast Drafting Model:** `nvidia/nemotron-3-super-120b-a12b` ("Super") — Ultra-low latency draft generation.
 - **Self-Healing Reasoning Model:** `nvidia/Nemotron-3-Ultra-550b-a55b` ("Ultra") — Deep multi-step repair when audits flag constraint violations or data loss.
-- **Database Engine:** `sqlite3` with sub-5ms `Connection.backup()` RAM cloning.
+- **Database Engine:** `sqlite3` with high-speed in-memory `Connection.backup()` RAM cloning (fast backup and restore times tracked separately).
 - **Dialect Analysis:** `sqlglot` for transactional statement classification and dangerous operation linting.
 
 ---
