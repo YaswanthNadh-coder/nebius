@@ -10,3 +10,4 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .hypothesis/
+live_smoke_out.json

@@ -34,4 +34,8 @@ ignore = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-addopts = "-q"
+addopts = "-q -m 'not live'"
+markers = [
+    "live: Live API tests against real Nebius endpoint (skipped by default)",
+]
+

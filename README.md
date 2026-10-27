@@ -85,7 +85,7 @@ The Time Machine enforces clear, deterministic boundaries between what is proven
    - **Rollback Round-Trip:** Verifies `down.sql` by applying `up.sql` then `down.sql` on a clone and asserting table checksum identity.
 
 2. **Row-Level Reference Oracles (`VERIFIED` status):**
-   - For standard transformations (`split_name`, `strip_honorific`, `cast_int`, `cast_cents`, `default_if_null`, `map_via_lookup`, `normalize_date`, `trim_case`), an independent Python reference implementation runs alongside the SQL. Every migrated row is compared against the oracle. When invariants and oracle agree, the run is marked **`VERIFIED`**.
+   - For standard transformations (`split_name`, `strip_honorific`, `cast_int`, `cast_cents`, `default_if_null`, `map_via_lookup`, `normalize_date`, `trim`, `lower`, `upper`), an independent Python reference implementation runs alongside the SQL. Every migrated row is compared against the oracle. When invariants and oracle agree, the run is marked **`VERIFIED`**.
 
 ### What is NOT Verified (`UNVERIFIED` status):
 - For complex, proprietary business transformations outside the reference library where no independent deterministic oracle is configured, the migration will be marked **`UNVERIFIED`** (provided all invariant checks pass).
@@ -143,6 +143,8 @@ In `.env`, set your key:
 NEBIUS_API_KEY=your_nebius_api_key_here
 ```
 > **Robust Key Loading:** The application automatically handles UTF-8 BOM (`\ufeff`), UTF-16, surrounding whitespace, and quotes. You can also provide or override the key directly in the Streamlit sidebar.
+>
+> ⚠️ **Security Note:** Never paste API keys into public chats, issues, or pull requests, and never commit `.env` to source control. The repository `.gitignore` ensures your `.env` remains local and ignored.
 
 ### 5. Launch the Streamlit Web Dashboard
 ```bash
@@ -163,6 +165,7 @@ The web interface is organized into five persistent tabs (`st.session_state` pre
 
 1. **🔌 Connect:**
    - Upload a `.sqlite`/`.db` file, provide a local path, paste a `.sql` schema dump, or pick one of the built-in realistic demo scenarios.
+   - **Upload State Persistence:** Uploaded files and schema dumps are fingerprinted `(name, size, sha256)` and loaded into memory once per file. Subsequent widget interactions and Streamlit reruns preserve your generated MigrationSpec and approval state without resetting or reloading the file.
    - Deep schema explorer inspecting tables, columns, indexes, foreign keys, triggers, and views.
    - Configure size caps (default 200 MB) and foreign key enforcement toggle.
 2. **📋 Plan:**
@@ -202,6 +205,15 @@ python -m timemachine run --db app.sqlite --goal goal.txt --out migrations/ --fo
 - **`0`**: **VERIFIED** — Invariants passed and oracle assertions confirmed. Safe to deploy.
 - **`1`**: **FAILED** — Constraint violation, data loss, or execution error detected.
 - **`2`**: **UNVERIFIED** — Invariant checks passed, but custom transforms require human review.
+
+### Agent Stop Reasons
+- **`SUCCESS`**: All invariant and oracle verification checks passed (`VERIFIED` or `UNVERIFIED`).
+- **`NO_PROGRESS`**: Model returned identical SQL across repair attempts without making progress.
+- **`SPEC_INVALID`**: MigrationSpec failed schema validation checks against the live database schema (e.g. unknown target table, missing source column).
+- **`PLAN_FAILED`**: Model failed to generate a valid MigrationSpec conforming to JSONSchema.
+- **`MODEL_RETURNED_NO_SQL`**: Model produced consecutive responses containing no executable SQL statements.
+- **`STEP_BUDGET_EXHAUSTED`**: Step budget exceeded without satisfying all verification invariants.
+- **`WALL_CLOCK_TIMEOUT`**: Total agent execution time exceeded the configured wall-clock budget (default 180s).
 
 ---
 

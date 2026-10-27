@@ -2,6 +2,7 @@
 
 import hashlib
 import os
+from typing import Any
 
 import streamlit as st
 
@@ -47,10 +48,21 @@ def init_session_state():
         "inject_traps": True,
         "api_key_override": "",
         "active_tab": 0,
+        "source_fingerprint": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+
+
+def set_source(adapter: SQLiteAdapter, name: str, fingerprint: Any):
+    """Set active database source adapter and fingerprint; reset dependent plan state."""
+    st.session_state["adapter"] = adapter
+    st.session_state["adapter_name"] = name
+    st.session_state["source_fingerprint"] = fingerprint
+    st.session_state["spec"] = None
+    st.session_state["spec_approved"] = False
+    st.session_state["run_result"] = None
 
 
 def create_builtin_scenario_adapter(scenario: int = 1) -> SQLiteAdapter:
@@ -202,59 +214,50 @@ def render_connect_tab():
     )
 
     if source_type == "Built-in Scenario: Dept Normalization":
-        if st.session_state.get("adapter_name") != "Scenario 1" or st.session_state.get("adapter") is None:
-            st.session_state["adapter"] = create_builtin_scenario_adapter(1)
-            st.session_state["adapter_name"] = "Scenario 1"
+        fp = "builtin:scenario_1"
+        if st.session_state.get("source_fingerprint") != fp or st.session_state.get("adapter") is None:
+            adapter = create_builtin_scenario_adapter(1)
+            set_source(adapter, "Scenario 1", fp)
             st.session_state["target_table"] = "employees"
             st.session_state["goal"] = "Normalize department into a separate departments table and split full_name into first_name and last_name."
-            st.session_state["spec"] = None
-            st.session_state["spec_approved"] = False
-            st.session_state["run_result"] = None
 
     elif source_type == "Built-in Scenario: Salary Banding":
-        if st.session_state.get("adapter_name") != "Scenario 2" or st.session_state.get("adapter") is None:
-            st.session_state["adapter"] = create_builtin_scenario_adapter(2)
-            st.session_state["adapter_name"] = "Scenario 2"
+        fp = "builtin:scenario_2"
+        if st.session_state.get("source_fingerprint") != fp or st.session_state.get("adapter") is None:
+            adapter = create_builtin_scenario_adapter(2)
+            set_source(adapter, "Scenario 2", fp)
             st.session_state["target_table"] = "employees"
             st.session_state["goal"] = "Clean raw_salary by converting string amounts ($120,000) to integer cents in salary_cents, and compute salary_band."
-            st.session_state["spec"] = None
-            st.session_state["spec_approved"] = False
-            st.session_state["run_result"] = None
 
     elif source_type == "Upload .sqlite / .db File":
         uploaded = st.file_uploader("Upload SQLite database (.sqlite, .db)", type=["sqlite", "db", "sqlite3"])
         if uploaded is not None:
-            raw_bytes = uploaded.read()
-            adapter = SQLiteAdapter.from_bytes(raw_bytes)
-            st.session_state["adapter"] = adapter
-            st.session_state["adapter_name"] = uploaded.name
-            st.session_state["spec"] = None
-            st.session_state["spec_approved"] = False
-            st.session_state["run_result"] = None
-            st.success(f"Loaded '{uploaded.name}' ({len(raw_bytes) / 1024:.1f} KB) into isolated sandbox memory.")
+            raw_bytes = uploaded.getvalue()
+            fp = (uploaded.name, len(raw_bytes), hashlib.sha256(raw_bytes).hexdigest())
+            if st.session_state.get("source_fingerprint") != fp or st.session_state.get("adapter") is None:
+                adapter = SQLiteAdapter.from_bytes(raw_bytes)
+                set_source(adapter, uploaded.name, fp)
+                st.success(f"Loaded '{uploaded.name}' ({len(raw_bytes) / 1024:.1f} KB) into isolated sandbox memory.")
 
     elif source_type == "Upload .sql Dump Script":
         uploaded_sql = st.file_uploader("Upload SQL schema dump script (.sql)", type=["sql"])
         if uploaded_sql is not None:
-            dump_str = uploaded_sql.read().decode("utf-8", errors="replace")
-            adapter = SQLiteAdapter.from_sql_dump(dump_str)
-            st.session_state["adapter"] = adapter
-            st.session_state["adapter_name"] = uploaded_sql.name
-            st.session_state["spec"] = None
-            st.session_state["spec_approved"] = False
-            st.session_state["run_result"] = None
-            st.success(f"Executed dump '{uploaded_sql.name}' into sandbox memory.")
+            raw_bytes = uploaded_sql.getvalue()
+            fp = (uploaded_sql.name, len(raw_bytes), hashlib.sha256(raw_bytes).hexdigest())
+            if st.session_state.get("source_fingerprint") != fp or st.session_state.get("adapter") is None:
+                dump_str = raw_bytes.decode("utf-8", errors="replace")
+                adapter = SQLiteAdapter.from_sql_dump(dump_str)
+                set_source(adapter, uploaded_sql.name, fp)
+                st.success(f"Executed dump '{uploaded_sql.name}' into sandbox memory.")
 
     elif source_type == "Local Database Filepath":
         local_path = st.text_input("Absolute path to SQLite database on disk:", value="")
         if local_path and os.path.exists(local_path):
+            mtime = os.path.getmtime(local_path)
+            fp = (os.path.abspath(local_path), mtime)
             if st.button("Open Local DB"):
                 adapter = SQLiteAdapter.from_file(local_path)
-                st.session_state["adapter"] = adapter
-                st.session_state["adapter_name"] = os.path.basename(local_path)
-                st.session_state["spec"] = None
-                st.session_state["spec_approved"] = False
-                st.session_state["run_result"] = None
+                set_source(adapter, os.path.basename(local_path), fp)
                 st.success(f"Connected to '{local_path}' in read-only mode.")
 
     adapter = st.session_state.get("adapter")
@@ -357,6 +360,7 @@ def render_plan_tab():
                 generate_clicked = True
 
     if generate_clicked:
+        st.session_state["run_result"] = None
         with st.spinner("Analyzing schema and drafting MigrationSpec..."):
             try:
                 clean_key, _, _ = get_api_key_info(st.session_state.get("api_key_override"))
@@ -404,6 +408,10 @@ def render_plan_tab():
 
     spec: MigrationSpec | None = st.session_state.get("spec")
     if spec:
+        target_t = st.session_state.get("target_table", "employees")
+        if not spec.get_table_mappings(target_t):
+            st.warning("⚠️ No column mappings for target table (no oracle: result will be UNVERIFIED).")
+
         st.subheader("📋 Generated MigrationSpec (JSON)")
         st.json(spec.model_dump())
 

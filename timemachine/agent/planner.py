@@ -1,6 +1,7 @@
 """Migration planning, prompt construction, JSON normalization, and spec generation."""
 
 import json
+import re
 import time
 from typing import Any, get_args
 
@@ -10,6 +11,7 @@ from pydantic import BaseModel
 from timemachine.adapters.schema import DatabaseSchema
 from timemachine.agent.llm import call_llm
 from timemachine.agent.prompts import format_schema_summary
+from timemachine.config import AgentError
 from timemachine.logging import get_logger
 from timemachine.verify.spec import MigrationSpec, TransformType
 
@@ -59,11 +61,27 @@ Output ONLY the MigrationSpec JSON object inside a ```json ``` block."""
 
 def extract_json_from_text(raw_text: str) -> dict[str, Any]:
     """Extract and parse JSON object from LLM response text."""
-    cleaned = raw_text.strip()
+    # 1. Strip <think>...</think> and unclosed <think>...
+    cleaned = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.DOTALL | re.IGNORECASE).strip()
+
+    # 2. Check for fenced JSON blocks
     if "```json" in cleaned:
         cleaned = cleaned.split("```json", 1)[1].split("```", 1)[0].strip()
+        return json.loads(cleaned)
     elif "```" in cleaned:
         cleaned = cleaned.split("```", 1)[1].split("```", 1)[0].strip()
+        return json.loads(cleaned)
+
+    # 3. If there is no fence, parse the first balanced {...} with json.JSONDecoder().raw_decode
+    start_idx = cleaned.find("{")
+    if start_idx != -1:
+        decoder = json.JSONDecoder()
+        obj, _ = decoder.raw_decode(cleaned[start_idx:])
+        if isinstance(obj, dict):
+            return obj
+        raise ValueError(f"Decoded JSON is not an object: {type(obj)}")
+
     return json.loads(cleaned)
 
 
@@ -113,6 +131,115 @@ def normalize_plan_dict(plan_dict: dict[str, Any], target_table: str = "employee
     return plan_dict
 
 
+def validate_spec_against_schema(
+    spec: MigrationSpec,
+    schema: DatabaseSchema,
+    target_table: str,
+) -> list[str]:
+    """Validate MigrationSpec against the actual database schema.
+
+    Checks:
+    1. target_table is in affected_tables
+    2. each affected table exists (or is explicitly declared as created by the migration)
+    3. every source_column exists in the source table (or is None)
+    4. lookup_table, lookup_key and lookup_val exist
+    5. columns_declared_unchanged and expected_constraints reference real columns
+    """
+    errors: list[str] = []
+
+    # 1. target_table is in affected_tables
+    if target_table not in spec.affected_tables:
+        errors.append(
+            f"Target table '{target_table}' is not in affected_tables: {spec.affected_tables}"
+        )
+
+    # 2. each affected table exists (or is explicitly declared as created by the migration)
+    created_tables: set[str] = set()
+    for op in spec.risky_operations:
+        m = re.search(r"\b(?:create|creates|created|new)\s+(?:table\s+)?([a-zA-Z0-9_]+)\b", str(op), re.IGNORECASE)
+        if m:
+            created_tables.add(m.group(1).lower())
+    if spec.goal:
+        m_goal = re.findall(r"\b(?:create|creates|created|new)\s+(?:table\s+)?([a-zA-Z0-9_]+)\b", spec.goal, re.IGNORECASE)
+        for g_tbl in m_goal:
+            created_tables.add(g_tbl.lower())
+
+    for tbl in spec.affected_tables:
+        if tbl not in schema.tables and tbl.lower() not in created_tables:
+            errors.append(
+                f"Affected table '{tbl}' does not exist in schema and is not declared as created by migration"
+            )
+
+    # 3. every source_column exists in the source table (or is None)
+    for tbl_name, mappings in spec.column_mappings.items():
+        if tbl_name in schema.tables:
+            tbl_info = schema.get_table(tbl_name)
+            col_names = {c.name for c in tbl_info.columns} if tbl_info else set()
+            for m in mappings:
+                if m.source_column is not None and m.source_column not in col_names:
+                    errors.append(
+                        f"ColumnMapping for '{tbl_name}.{m.new_column}' references nonexistent source_column '{m.source_column}'"
+                    )
+
+    # 4. lookup_table, lookup_key and lookup_val exist
+    for tbl_name, mappings in spec.column_mappings.items():
+        for m in mappings:
+            if m.lookup_table or m.lookup_key or m.lookup_val or m.transform == "map_via_lookup":
+                if m.lookup_table:
+                    if m.lookup_table not in schema.tables and m.lookup_table.lower() not in created_tables:
+                        errors.append(
+                            f"Lookup table '{m.lookup_table}' in mapping for '{m.new_column}' does not exist in schema"
+                        )
+                    else:
+                        lt_info = schema.get_table(m.lookup_table)
+                        lt_cols = {c.name for c in lt_info.columns} if lt_info else set()
+                        if m.lookup_key and m.lookup_key not in lt_cols:
+                            errors.append(
+                                f"Lookup key '{m.lookup_key}' does not exist in lookup table '{m.lookup_table}'"
+                            )
+                        if m.lookup_val and m.lookup_val not in lt_cols:
+                            errors.append(
+                                f"Lookup val '{m.lookup_val}' does not exist in lookup table '{m.lookup_table}'"
+                            )
+
+    # 5. columns_declared_unchanged and expected_constraints reference real columns
+    SQL_KEYWORDS = {
+        "PRIMARY", "KEY", "NOT", "NULL", "UNIQUE", "CHECK", "FOREIGN",
+        "REFERENCES", "INTEGER", "TEXT", "REAL", "BLOB", "DEFAULT",
+        "AUTOINCREMENT", "AND", "OR", "ASC", "DESC",
+    }
+    for tbl_name, cols in spec.columns_declared_unchanged.items():
+        if tbl_name in schema.tables:
+            tbl_info = schema.get_table(tbl_name)
+            col_names = {c.name for c in tbl_info.columns} if tbl_info else set()
+            for col in cols:
+                if col not in col_names:
+                    errors.append(
+                        f"columns_declared_unchanged specifies '{col}' which does not exist in table '{tbl_name}'"
+                    )
+
+    for tbl_name, constraints in spec.expected_constraints.items():
+        if tbl_name in schema.tables:
+            tbl_info = schema.get_table(tbl_name)
+            col_names = {c.name for c in tbl_info.columns} if tbl_info else set()
+            new_cols = {m.new_column for m in spec.get_table_mappings(tbl_name)}
+            valid_cols = col_names | new_cols
+            for item in constraints:
+                words = re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]*\b", item)
+                col_words = [w for w in words if w.upper() not in SQL_KEYWORDS]
+                if col_words:
+                    if not any(w in valid_cols for w in col_words):
+                        errors.append(
+                            f"expected_constraints for table '{tbl_name}' references nonexistent column in '{item}'"
+                        )
+                elif item not in valid_cols:
+                    errors.append(
+                        f"expected_constraints for table '{tbl_name}' references nonexistent column '{item}'"
+                    )
+
+    return errors
+
+
 def generate_spec(
     client: OpenAI,
     model: str,
@@ -135,8 +262,32 @@ def generate_spec(
         raw_response = raw_msg.content or ""
         plan_dict = extract_json_from_text(raw_response)
         normalized = normalize_plan_dict(plan_dict, target_table=target_table)
-        spec = MigrationSpec.model_validate(normalized)
+        candidate = MigrationSpec.model_validate(normalized)
+        val_errs = validate_spec_against_schema(candidate, schema, target_table)
+        if val_errs:
+            raise ValueError(f"Schema validation failed: {'; '.join(val_errs)}")
+        spec = candidate
+    except AgentError as ae:
+        logger.error(f"Planning failed due to AgentError: {ae}")
+        return SpecResult(
+            spec=None,
+            source="error",
+            raw_response=raw_response,
+            error=str(ae),
+            model=model,
+            latency_ms=(time.time() - start_time) * 1000,
+        )
     except Exception as first_exc:
+        if not raw_response.strip():
+            logger.error(f"Model returned empty response for plan: {first_exc}")
+            return SpecResult(
+                spec=None,
+                source="error",
+                raw_response="",
+                error=f"Model returned empty response: {first_exc}",
+                model=model,
+                latency_ms=(time.time() - start_time) * 1000,
+            )
         logger.warning(f"Initial MigrationSpec parsing failed: {first_exc}. Retrying once with error feedback...")
         # Retry once with pydantic error appended
         retry_prompt = (
@@ -153,7 +304,21 @@ def generate_spec(
             raw_response = retry_msg.content or ""
             plan_dict = extract_json_from_text(raw_response)
             normalized = normalize_plan_dict(plan_dict, target_table=target_table)
-            spec = MigrationSpec.model_validate(normalized)
+            candidate = MigrationSpec.model_validate(normalized)
+            val_errs = validate_spec_against_schema(candidate, schema, target_table)
+            if val_errs:
+                raise ValueError(f"Schema validation failed after retry: {'; '.join(val_errs)}")
+            spec = candidate
+        except AgentError as ae:
+            logger.error(f"Plan retry failed due to AgentError: {ae}")
+            return SpecResult(
+                spec=None,
+                source="error",
+                raw_response=raw_response,
+                error=str(ae),
+                model=model,
+                latency_ms=(time.time() - start_time) * 1000,
+            )
         except Exception as retry_exc:
             error_str = f"Plan validation failed after retry: {retry_exc}"
             logger.error(error_str)

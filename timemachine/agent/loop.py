@@ -1,5 +1,6 @@
 """Autonomous agent loop with tool-calling, tiered model escalation, and structured telemetry."""
 
+import hashlib
 import json
 import re
 import time
@@ -10,13 +11,13 @@ from pydantic import BaseModel, Field
 
 from timemachine.adapters.base import DbAdapter
 from timemachine.agent.llm import call_llm, clean_sql, get_client, resolve_nebius_models
-from timemachine.agent.planner import generate_spec
+from timemachine.agent.planner import generate_spec, validate_spec_against_schema
 from timemachine.agent.prompts import (
     build_migration_prompt,
     build_repair_prompt,
 )
 from timemachine.agent.tools import TOOL_DEFINITIONS, ToolExecutor
-from timemachine.config import get_settings
+from timemachine.config import AgentError, get_settings
 from timemachine.logging import get_logger
 from timemachine.traps.generator import audit_traps
 from timemachine.traps.profiler import profile_database
@@ -59,24 +60,90 @@ class AgentRunResult(BaseModel):
     model_warnings: list[str] = Field(default_factory=list)
 
 
+def has_ddl_or_dml(sql: str) -> bool:
+    """Check if SQL contains any DDL or DML statements (not just queries or empty checks)."""
+    if not sql:
+        return False
+    s = re.sub(r"--.*$", "", sql, flags=re.MULTILINE)
+    s = re.sub(r"/\*[\s\S]*?\*/", "", s)
+    return bool(re.search(r"\b(CREATE|ALTER|DROP|INSERT|UPDATE|DELETE|REPLACE|TRUNCATE)\b", s, re.IGNORECASE))
+
+
+def normalize_sql_for_progress(sql: str) -> str:
+    """Normalize SQL for progress detection: strip comments, collapse whitespace, lowercase."""
+    s = re.sub(r"--.*$", "", sql, flags=re.MULTILINE)
+    s = re.sub(r"/\*[\s\S]*?\*/", "", s)
+    return re.sub(r"\s+", " ", s).strip().lower()
+
+
+def _clean_extracted_block(block: str) -> str:
+    """Clean extracted SQL block by stripping think tags, stray fences, and extra whitespace."""
+    if not block:
+        return ""
+    t = block.replace("\r\n", "\n")
+    t = re.sub(r"<think>.*?</think>", "", t, flags=re.DOTALL)
+    t = re.sub(r"<think>.*", "", t, flags=re.DOTALL)
+    t = re.sub(r"^```[a-zA-Z0-9_-]*\s*$", "", t, flags=re.MULTILINE)
+    return t.strip()
+
+
+def _clean_sql_section(section: str) -> str:
+    """Clean a SQL section from free-form text or stripped fences."""
+    cleaned = _clean_extracted_block(section)
+    res = clean_sql(cleaned)
+    return res if res else cleaned
+
+
 def parse_sql_scripts(content: str) -> tuple[str, str]:
-    """Parse UP and optional DOWN migration scripts from LLM content."""
-    if "-- DOWN" in content:
-        parts = content.split("-- DOWN", 1)
-        up = clean_sql(parts[0])
-        down = clean_sql(parts[1])
+    """Parse UP and optional DOWN migration scripts from LLM content without guessing by position."""
+    text = content.replace("\r\n", "\n")
+
+    # 1. Split on a line matching ^\s*--\s*(DOWN|ROLLBACK)\b (case-insensitive)
+    down_line_re = re.compile(r"(?im)^\s*--\s*(?:DOWN|ROLLBACK)\b.*$")
+    match = down_line_re.search(text)
+    if match:
+        up_part = text[:match.start()]
+        down_part = text[match.end():]
+        up = _clean_sql_section(up_part)
+        down = _clean_sql_section(down_part)
+        if not has_ddl_or_dml(down):
+            down = ""
         return up, down
 
-    fence_re = re.compile(
-        r"^```(?:sql|sqlite)?\s*$\n(.*?)^```\s*$",
-        re.MULTILINE | re.DOTALL | re.IGNORECASE,
+    # 2. Check for fenced blocks with down/rollback fence tags or preceding prose labelled down/rollback
+    fence_pattern = re.compile(
+        r"(?:^|\n)```([a-zA-Z0-9_-]*)\s*\n(.*?)\n```",
+        re.DOTALL,
     )
-    blocks = fence_re.findall(content.replace("\r\n", "\n"))
-    valid_blocks = [b.strip() for b in blocks if b.strip()]
-    if len(valid_blocks) >= 2:
-        return clean_sql(valid_blocks[0]), clean_sql(valid_blocks[1])
+    matches = list(fence_pattern.finditer(text))
+    if matches:
+        down_start_idx = None
+        for i, m in enumerate(matches):
+            tag = m.group(1).lower()
+            if "down" in tag or "rollback" in tag:
+                down_start_idx = i
+                break
+            prev_end = matches[i - 1].end() if i > 0 else 0
+            prose = text[prev_end:m.start()].strip()
+            if re.search(r"(?im)^\s*(?:down|rollback|down\s+migration|rollback\s+script):?\s*$", prose):
+                down_start_idx = i
+                break
 
-    return clean_sql(content), ""
+        if down_start_idx is not None:
+            up_blocks = [_clean_extracted_block(matches[j].group(2)) for j in range(down_start_idx) if matches[j].group(2).strip()]
+            down_blocks = [_clean_extracted_block(matches[j].group(2)) for j in range(down_start_idx, len(matches)) if matches[j].group(2).strip()]
+            up = "\n\n".join(b for b in up_blocks if b)
+            down = "\n\n".join(b for b in down_blocks if b)
+            if not has_ddl_or_dml(down):
+                down = ""
+            return up, down
+
+        # Otherwise treat ALL fenced blocks as UP (concatenate in order) and down = ""
+        all_blocks = [_clean_extracted_block(m.group(2)) for m in matches if m.group(2).strip()]
+        up = "\n\n".join(b for b in all_blocks if b)
+        return up, ""
+
+    return clean_sql(text), ""
 
 
 def run_time_machine_agent(
@@ -113,8 +180,26 @@ def run_time_machine_agent(
     tbl = schema.get_table(target_table)
     prod_rows = tbl.row_count if tbl else 1000
 
-    # Phase 1: Planning (derive spec if not provided)
-    if spec is None:
+    # Phase 1: Planning (derive spec if not provided, or validate supplied spec)
+    if spec is not None:
+        val_errors = validate_spec_against_schema(spec, schema, target_table)
+        if val_errors:
+            logger.error(f"Supplied MigrationSpec failed schema validation: {val_errors}")
+            return AgentRunResult(
+                status="FAILED",
+                up_sql="",
+                down_sql="",
+                spec=spec,
+                steps=steps,
+                total_tokens=total_tokens,
+                total_latency_ms=(time.time() - start_time) * 1000,
+                stop_reason="SPEC_INVALID",
+                notes=f"Specification invalid for current schema: {'; '.join(val_errors)}",
+                fast_model=fast_model,
+                ultra_model=ultra_model,
+                model_warnings=warnings,
+            )
+    else:
         notify(f"Generating MigrationSpec using {fast_model}...")
         clone = adapter.clone()
         try:
@@ -177,6 +262,10 @@ def run_time_machine_agent(
     tool_executor = ToolExecutor(adapter, spec=spec, target_table=target_table)
 
     # Phase 2: Agent Tool/Draft Loop
+    settings = get_settings()
+    wall_clock_budget = settings.agent_wall_clock_timeout_s
+    max_tool_rounds = settings.max_tool_rounds_per_step
+
     current_model = fast_model
     current_up_sql = ""
     current_down_sql = ""
@@ -185,11 +274,16 @@ def run_time_machine_agent(
     step_num = 0
     consecutive_no_sql = 0
     last_raw_reply = ""
+    last_tool_sql = ""
+    has_drafted_sql = False
+    repeat_feedback: str | None = None
+    seen_sql_attempts: dict[str, tuple[int, list[str]]] = {}
+    repeat_counts: dict[str, int] = {}
 
     while step_num < max_steps:
         step_num += 1
         elapsed_total = time.time() - start_time
-        if elapsed_total > 180.0:
+        if elapsed_total > wall_clock_budget:
             return AgentRunResult(
                 status="FAILED",
                 up_sql=current_up_sql,
@@ -199,13 +293,20 @@ def run_time_machine_agent(
                 invariant_result=inv_result,
                 total_tokens=total_tokens,
                 total_latency_ms=elapsed_total * 1000,
-                stop_reason="WALL_CLOCK_TIMEOUT: Exceeded 180s budget.",
+                stop_reason=f"WALL_CLOCK_TIMEOUT: Exceeded {round(wall_clock_budget)}s budget.",
                 fast_model=fast_model,
                 ultra_model=ultra_model,
                 model_warnings=warnings,
             )
 
-        if inv_result is None:
+        if repeat_feedback:
+            notify(f"Re-prompting {current_model} after identical attempt detected...", {"step": step_num})
+            traps = inv_result.trap_audit if inv_result else []
+            sql_to_repair = current_up_sql or last_tool_sql
+            base_p = build_repair_prompt(schema, spec, sql_to_repair, inv_result, trap_results=traps)
+            prompt = f"Your previous reply was {repeat_feedback}.\n\n{base_p}"
+            repeat_feedback = None
+        elif inv_result is None:
             if consecutive_no_sql > 0 and last_raw_reply:
                 notify(f"Re-prompting {current_model} for migration SQL...", {"step": step_num})
                 prompt = build_repair_prompt(schema, spec, last_raw_reply, None)
@@ -215,7 +316,8 @@ def run_time_machine_agent(
         else:
             notify(f"Escalating repair to {current_model} with structured failure telemetry...", {"step": step_num})
             traps = inv_result.trap_audit if inv_result else []
-            prompt = build_repair_prompt(schema, spec, current_up_sql, inv_result, trap_results=traps)
+            sql_to_repair = current_up_sql or last_tool_sql
+            prompt = build_repair_prompt(schema, spec, sql_to_repair, inv_result, trap_results=traps)
 
         messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
         step_up_sql = ""
@@ -225,19 +327,47 @@ def run_time_machine_agent(
         last_step_lat = 0.0
         step_usage = None
 
-        while tool_rounds < 4:
+        while tool_rounds < max_tool_rounds:
             tool_rounds += 1
-            remaining_s = max(1.0, 180.0 - (time.time() - start_time))
+            remaining_s = max(1.0, wall_clock_budget - (time.time() - start_time))
             step_start = time.time()
 
-            raw_msg, usage = call_llm(
-                client,
-                current_model,
-                messages=messages,
-                temperature=0.2,
-                tools=TOOL_DEFINITIONS,
-                timeout=min(remaining_s, get_settings().llm_timeout_s),
-            )
+            try:
+                raw_msg, usage = call_llm(
+                    client,
+                    current_model,
+                    messages=messages,
+                    temperature=0.2,
+                    tools=TOOL_DEFINITIONS,
+                    timeout=min(remaining_s, settings.llm_timeout_s),
+                )
+            except AgentError as ae:
+                logger.error(f"Agent LLM call failed: {ae}")
+                steps.append(
+                    AgentStepLog(
+                        step=len(steps) + 1,
+                        model=current_model,
+                        action="call_llm_error",
+                        details={"error": str(ae)},
+                        latency_ms=(time.time() - step_start) * 1000,
+                        status="error",
+                    )
+                )
+                return AgentRunResult(
+                    status="FAILED",
+                    up_sql=current_up_sql,
+                    down_sql=current_down_sql,
+                    spec=spec,
+                    steps=steps,
+                    invariant_result=inv_result,
+                    total_tokens=total_tokens,
+                    total_latency_ms=(time.time() - start_time) * 1000,
+                    stop_reason=f"AGENT_ERROR: {ae}",
+                    notes=f"Agent LLM error: {ae}",
+                    fast_model=fast_model,
+                    ultra_model=ultra_model,
+                    model_warnings=warnings,
+                )
             last_step_lat = (time.time() - step_start) * 1000
             step_usage = usage
 
@@ -302,6 +432,12 @@ def run_time_machine_agent(
                         notes = res.get("notes", "")
                     elif fn_name == "run_on_clone":
                         inv_result = InvariantResult.model_validate(res)
+                        try:
+                            p_args = json.loads(fn_args) if isinstance(fn_args, str) else fn_args
+                            if isinstance(p_args, dict) and "up_sql" in p_args and p_args["up_sql"]:
+                                last_tool_sql = p_args["up_sql"]
+                        except Exception:
+                            pass
 
                     res_str = json.dumps(res)
                     if len(res_str) > 4000:
@@ -352,15 +488,66 @@ def run_time_machine_agent(
 
         consecutive_no_sql = 0
         last_raw_reply = ""
+
+        # Check for repeated SQL / no-progress
+        norm_sql = normalize_sql_for_progress(step_up_sql)
+        sql_hash = hashlib.sha256(norm_sql.encode()).hexdigest()
+
+        if sql_hash in seen_sql_attempts:
+            orig_step, orig_failed = seen_sql_attempts[sql_hash]
+            repeat_counts[sql_hash] = repeat_counts.get(sql_hash, 0) + 1
+            if repeat_counts[sql_hash] >= 2:
+                steps.append(
+                    AgentStepLog(
+                        step=len(steps) + 1,
+                        model=current_model,
+                        action="no_progress",
+                        details={"repeat_of_step": orig_step, "sql_preview": step_up_sql[:200]},
+                        status="error",
+                    )
+                )
+                return AgentRunResult(
+                    status="FAILED",
+                    up_sql=current_up_sql,
+                    down_sql=current_down_sql,
+                    spec=spec,
+                    steps=steps,
+                    invariant_result=inv_result,
+                    total_tokens=total_tokens,
+                    total_latency_ms=(time.time() - start_time) * 1000,
+                    stop_reason="NO_PROGRESS",
+                    notes=f"Model returned identical SQL to attempt {orig_step} twice without progress.",
+                    fast_model=fast_model,
+                    ultra_model=ultra_model,
+                    model_warnings=warnings,
+                )
+            else:
+                failed_str = ", ".join(orig_failed) if orig_failed else "verification failure"
+                repeat_feedback = f"identical to attempt {orig_step} which failed with {failed_str}; change approach"
+                steps.append(
+                    AgentStepLog(
+                        step=len(steps) + 1,
+                        model=current_model,
+                        action="repeat_sql_skipped",
+                        details={"repeat_of_step": orig_step, "feedback": repeat_feedback},
+                        status="warning",
+                    )
+                )
+                current_model = ultra_model
+                continue
+
         current_up_sql = step_up_sql
         if step_down_sql:
             current_down_sql = step_down_sql
+
+        action_label = "draft_migration" if not has_drafted_sql else "repair_migration"
+        has_drafted_sql = True
 
         steps.append(
             AgentStepLog(
                 step=len(steps) + 1,
                 model=current_model,
-                action="draft_migration" if inv_result is None else "repair_migration",
+                action=action_label,
                 details={
                     "raw_reply": content[:500] if content else "",
                     "up_sql_preview": step_up_sql[:200],
@@ -416,6 +603,9 @@ def run_time_machine_agent(
             {"status": inv_result.status, "inv_result": inv_result.model_dump()},
         )
 
+        if not inv_result.passed:
+            seen_sql_attempts[sql_hash] = (step_num, list(inv_result.failed_checks))
+
         if inv_result.passed and inv_result.status in ("VERIFIED", "UNVERIFIED"):
             break
 
@@ -440,6 +630,8 @@ def run_time_machine_agent(
             base_clone.close()
         if not rollback_ok:
             notify(f"Rollback warning: {rollback_err}", {"lossy_columns": lossy_cols})
+    elif current_up_sql:
+        rollback_err = "no valid rollback script"
 
     # Estimate lock time
     lock_est = estimate_production_lock_time(

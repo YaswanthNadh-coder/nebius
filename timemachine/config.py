@@ -144,12 +144,20 @@ class Settings(BaseModel):
         description="Maximum agent tool-calling steps budget",
     )
     max_llm_tokens: int = Field(
-        default=4096,
+        default=8192,
         description="Maximum completion tokens per LLM invocation",
     )
     llm_timeout_s: float = Field(
         default=90.0,
         description="HTTP client timeout for LLM requests",
+    )
+    agent_wall_clock_timeout_s: float = Field(
+        default=180.0,
+        description="Maximum total wall-clock budget in seconds for an agent execution run",
+    )
+    max_tool_rounds_per_step: int = Field(
+        default=4,
+        description="Maximum tool calling rounds per step",
     )
 
 

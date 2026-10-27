@@ -418,4 +418,225 @@ def test_agent_stops_on_plan_failed():
     assert result.spec is None
 
 
+def test_parse_sql_scripts_three_blocks_concatenated_as_up():
+    from timemachine.agent.loop import parse_sql_scripts
+    content = """
+```sql
+ALTER TABLE employees ADD COLUMN first_name TEXT;
+```
+```sql
+UPDATE employees SET first_name = 'Alice';
+```
+```sql
+ALTER TABLE employees DROP COLUMN old_col;
+```
+"""
+    up, down = parse_sql_scripts(content)
+    assert "ADD COLUMN first_name" in up
+    assert "UPDATE employees" in up
+    assert "DROP COLUMN old_col" in up
+    assert down == ""
+
+
+def test_parse_sql_scripts_up_plus_select_check_block():
+    from timemachine.agent.loop import parse_sql_scripts
+    content = """
+```sql
+ALTER TABLE employees ADD COLUMN dept TEXT;
+```
+```sql
+SELECT COUNT(*) FROM employees;
+```
+"""
+    up, down = parse_sql_scripts(content)
+    assert "ADD COLUMN dept" in up
+    assert down == ""
+
+
+def test_parse_sql_scripts_down_migration_inside_one_fence():
+    from timemachine.agent.loop import parse_sql_scripts
+    content = """
+```sql
+ALTER TABLE employees ADD COLUMN dept TEXT;
+-- DOWN MIGRATION
+ALTER TABLE employees DROP COLUMN dept;
+```
+"""
+    up, down = parse_sql_scripts(content)
+    assert "ADD COLUMN dept" in up
+    assert "DROP COLUMN dept" in down
+
+
+def test_parse_sql_scripts_rollback_prose_before_block():
+    from timemachine.agent.loop import parse_sql_scripts
+    content = """
+Migration:
+```sql
+ALTER TABLE employees ADD COLUMN dept TEXT;
+```
+Rollback:
+```sql
+ALTER TABLE employees DROP COLUMN dept;
+```
+"""
+    up, down = parse_sql_scripts(content)
+    assert "ADD COLUMN dept" in up
+    assert "DROP COLUMN dept" in down
+
+
+def test_parse_sql_scripts_no_down_at_all():
+    from timemachine.agent.loop import parse_sql_scripts
+    content = """
+```sql
+ALTER TABLE employees ADD COLUMN dept TEXT;
+```
+"""
+    up, down = parse_sql_scripts(content)
+    assert "ADD COLUMN dept" in up
+    assert down == ""
+
+
+def test_parse_sql_scripts_reject_down_without_ddl_or_dml():
+    from timemachine.agent.loop import parse_sql_scripts
+    content = """
+```sql
+ALTER TABLE employees ADD COLUMN dept TEXT;
+-- DOWN
+SELECT * FROM employees;
+```
+"""
+    up, down = parse_sql_scripts(content)
+    assert "ADD COLUMN dept" in up
+    assert down == ""
+
+
+def test_agent_stops_on_spec_invalid():
+    """Agent validates user-supplied spec against schema and stops with SPEC_INVALID if checks fail."""
+    adapter = SQLiteAdapter.create_in_memory()
+    conn = adapter.open_readonly()
+    conn.execute("CREATE TABLE employees (id INT PRIMARY KEY, name TEXT);")
+    conn.commit()
+
+    client = MagicMock()
+    client.models.list.return_value.data = [
+        MagicMock(id="nvidia/nemotron-3-super-120b-a12b"),
+        MagicMock(id="nvidia/Nemotron-3-Ultra-550b-a55b"),
+    ]
+
+    invalid_spec = MigrationSpec(
+        affected_tables=["ghost_table"],  # Target table not in affected tables & table doesn't exist
+        goal="Invalid migration",
+    )
+
+    with patch("timemachine.agent.loop.get_client", return_value=client):
+        result = run_time_machine_agent(
+            adapter=adapter,
+            goal="Invalid migration",
+            spec=invalid_spec,
+            target_table="employees",
+            api_key_override="test_key_123456",
+        )
+
+    assert result.status == "FAILED"
+    assert result.stop_reason == "SPEC_INVALID"
+    assert "ghost_table" in result.notes or "Target table" in result.notes
+
+
+def test_agent_stops_on_no_progress_identical_sql():
+    """When a model returns identical failing SQL, the run stops with NO_PROGRESS after at most 3 LLM calls."""
+    adapter = SQLiteAdapter.create_in_memory()
+    conn = adapter.open_readonly()
+    conn.execute("CREATE TABLE employees (id INT PRIMARY KEY, name TEXT);")
+    conn.execute("INSERT INTO employees VALUES (1, 'Alice');")
+    conn.commit()
+
+    client = MagicMock()
+    client.models.list.return_value.data = [
+        MagicMock(id="nvidia/nemotron-3-super-120b-a12b"),
+        MagicMock(id="nvidia/Nemotron-3-Ultra-550b-a55b"),
+    ]
+
+    # Always returns the exact same invalid SQL statement that fails
+    identical_sql_reply = "```sql\nALTER TABLE employees ADD COLUMN first_name TEXT NOT NULL;\n```"
+    client.chat.completions.create.return_value = FakeResponse(content=identical_sql_reply)
+
+    spec = MigrationSpec(
+        affected_tables=["employees"],
+        goal="Split name",
+    )
+
+    with patch("timemachine.agent.loop.get_client", return_value=client):
+        result = run_time_machine_agent(
+            adapter=adapter,
+            goal="Split name",
+            spec=spec,
+            target_table="employees",
+            api_key_override="test_key_123456",
+            max_steps=8,
+        )
+
+    assert result.status == "FAILED"
+    assert result.stop_reason == "NO_PROGRESS"
+    assert client.chat.completions.create.call_count <= 3
+
+
+def test_tool_set_inv_result_tracks_last_tool_sql_and_preserves_draft_label():
+    """Tool-set inv_result preserves last_tool_sql for the next prompt and keeps draft_migration label."""
+    adapter = SQLiteAdapter.create_in_memory()
+    conn = adapter.open_readonly()
+    conn.execute("CREATE TABLE employees (id INT PRIMARY KEY, name TEXT);")
+    conn.commit()
+
+    client = MagicMock()
+    client.models.list.return_value.data = [
+        MagicMock(id="nvidia/nemotron-3-super-120b-a12b"),
+        MagicMock(id="nvidia/Nemotron-3-Ultra-550b-a55b"),
+    ]
+
+    # Step 1: Model calls run_on_clone with tool SQL, but outputs no SQL in the step response
+    tc = FakeToolCall(
+        fn_name="run_on_clone",
+        fn_args=json.dumps({"up_sql": "ALTER TABLE employees ADD COLUMN tool_test_col TEXT;"}),
+        call_id="call_clone_1",
+    )
+    # Turn 1: tool call
+    resp1 = FakeResponse(content=None, tool_calls=[tc])
+    # Turn 2 in Step 1: assistant says "Done checking" without any SQL block
+    resp2 = FakeResponse(content="Done checking clone.")
+
+    # Step 2: Model returns SQL
+    resp3 = FakeResponse(
+        content="```sql\nALTER TABLE employees ADD COLUMN first_name TEXT DEFAULT 'ok';\n```"
+    )
+
+    client.chat.completions.create.side_effect = [resp1, resp2, resp3]
+
+    spec = MigrationSpec(affected_tables=["employees"], goal="Split name")
+
+    with patch("timemachine.agent.loop.get_client", return_value=client):
+        result = run_time_machine_agent(
+            adapter=adapter,
+            goal="Split name",
+            spec=spec,
+            target_table="employees",
+            api_key_override="test_key_123456",
+            max_steps=4,
+        )
+
+    # Check Step 2 prompt:
+    # 3rd create call was for Step 2. Its prompt messages should contain 'tool_test_col'
+    step2_msgs = client.chat.completions.create.call_args_list[2][1]["messages"]
+    step2_prompt = step2_msgs[0]["content"]
+    assert "tool_test_col" in step2_prompt, f"last_tool_sql not included in repair prompt: {step2_prompt}"
+
+    # Verify action labels: step that produces the first migration SQL is labeled draft_migration
+    actions = [s.action for s in result.steps]
+    assert "draft_migration" in actions, f"Expected draft_migration in actions: {actions}"
+    assert "repair_migration" not in actions, f"repair_migration should not precede draft_migration: {actions}"
+
+
+
+
+
+
 
