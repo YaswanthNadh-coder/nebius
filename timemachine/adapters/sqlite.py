@@ -17,56 +17,35 @@ from timemachine.adapters.schema import (
 )
 from timemachine.config import AgentError, get_settings
 from timemachine.logging import get_logger
+from timemachine.verify.sandbox import (
+    ALLOWED_PRAGMAS,
+    SandboxAuthorizer,
+    calc_sandbox_timeout,
+    make_sandbox_authorizer,
+    make_sandbox_progress_handler,
+)
 
 logger = get_logger("adapters.sqlite")
 
-# SQLite authorizer action codes
-_SQLITE_OK = 0
-_SQLITE_DENY = 1
-_SQLITE_PRAGMA = 19
-_SQLITE_ATTACH = 24
-_SQLITE_DETACH = 25
-_SQLITE_FUNCTION = 31
-
-_ALLOWED_PRAGMAS = frozenset({
-    "table_info",
-    "table_xinfo",
-    "foreign_key_check",
-    "foreign_key_list",
-    "integrity_check",
-    "foreign_keys",
-    "index_list",
-    "index_info",
-})
+_ALLOWED_PRAGMAS = ALLOWED_PRAGMAS
 
 
-def make_authorizer():
+def make_authorizer() -> SandboxAuthorizer:
     """SQLite authorizer blocking ATTACH, DETACH, dangerous PRAGMAs, load_extension."""
-    def _auth(action, arg1, _arg2, _db_name, _trigger_name):
-        if action in (_SQLITE_ATTACH, _SQLITE_DETACH):
-            return _SQLITE_DENY
-        if action == _SQLITE_PRAGMA:
-            if arg1 and arg1.lower() not in _ALLOWED_PRAGMAS:
-                return _SQLITE_DENY
-        if action == _SQLITE_FUNCTION:
-            if arg1 and arg1.lower() == "load_extension":
-                return _SQLITE_DENY
-        return _SQLITE_OK
-    return _auth
+    return make_sandbox_authorizer()
 
 
 def make_progress_handler(deadline_s: float = 2.0):
     """SQLite progress handler aborting queries running longer than deadline."""
-    t0 = time.monotonic()
-    def _tick():
-        return 1 if (time.monotonic() - t0) > deadline_s else 0
-    return _tick
+    return make_sandbox_progress_handler(deadline_s)
 
 
-def install_sandbox(conn: sqlite3.Connection, timeout_s: float = 2.0) -> None:
+def install_sandbox(conn: sqlite3.Connection, timeout_s: float = 2.0) -> SandboxAuthorizer:
     """Install authorizer and progress handler on an untrusted execution connection."""
-    conn.set_authorizer(make_authorizer())
-    conn.set_progress_handler(make_progress_handler(timeout_s), 10_000)
+    auth = make_sandbox_authorizer()
+    conn.set_authorizer(auth)
+    conn.set_progress_handler(make_sandbox_progress_handler(timeout_s), 10_000)
+    return auth
 
 
 class SQLiteAdapter(DbAdapter):
@@ -359,8 +338,21 @@ class SQLiteAdapter(DbAdapter):
         sql: str,
         fk_enabled: bool = True,
     ) -> tuple[bool, str | None, float]:
-        """Execute SQL script inside sandboxed clone with configured foreign key enforcement."""
-        install_sandbox(clone_conn, timeout_s=self.settings.sandbox_timeout_s)
+        total_rows = 0
+        try:
+            cur_count = clone_conn.cursor()
+            cur_count.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+            for tbl_row in cur_count.fetchall():
+                try:
+                    cur_count.execute(f'SELECT COUNT(*) FROM "{tbl_row[0]}"')
+                    total_rows += cur_count.fetchone()[0]
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        scaled_timeout = calc_sandbox_timeout(total_rows, base_timeout_s=self.settings.sandbox_timeout_s)
+        authorizer = install_sandbox(clone_conn, timeout_s=scaled_timeout)
         cur = clone_conn.cursor()
         t0 = time.perf_counter()
 
@@ -374,9 +366,10 @@ class SQLiteAdapter(DbAdapter):
             elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
             msg = str(exc)
             if "interrupted" in msg.lower():
-                return False, f"TIMEOUT after {self.settings.sandbox_timeout_s:.0f}s: query exceeded execution time limit.", elapsed_ms
+                return False, f"TIMEOUT after {scaled_timeout:.1f}s: query exceeded execution time limit.", elapsed_ms
             if "not authorized" in msg.lower() or "authorization denied" in msg.lower():
-                return False, f"SANDBOX VIOLATION: {msg}", elapsed_ms
+                denial_reason = authorizer.last_denial if authorizer and authorizer.last_denial else msg
+                return False, f"SANDBOX VIOLATION: {denial_reason}", elapsed_ms
             return False, f"SQLITE EXECUTION CRASH: {msg}", elapsed_ms
 
     def close(self) -> None:

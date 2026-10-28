@@ -55,34 +55,47 @@ def mask_value(val: Any) -> str:
     return f"{s[0]}{'*' * min(len(s) - 2, 4)}{s[-1]}"
 
 
-def profile_table(conn: sqlite3.Connection, table_schema: TableSchema, limit_samples: int = 5) -> dict[str, ColumnProfile]:
+MAX_SAMPLE_ROWS = 50000
+
+
+def profile_table(conn: sqlite3.Connection, table_schema: TableSchema | str, limit_samples: int = 5) -> dict[str, ColumnProfile]:
     """Inspect columns in table, compute aggregate statistics and generate masked samples."""
     cur = conn.cursor()
+    if isinstance(table_schema, str):
+        from timemachine.adapters.schema import ColumnInfo
+        cur.execute(f'PRAGMA table_info("{table_schema}")')
+        cols = [ColumnInfo(name=r[1], type=r[2], notnull=bool(r[3]), pk=bool(r[5])) for r in cur.fetchall()]
+        table_schema = TableSchema(name=table_schema, columns=cols)
     tname = table_schema.name
     profiles: dict[str, ColumnProfile] = {}
 
     cur.execute(f"SELECT COUNT(*) FROM \"{tname}\"")
     total_rows = cur.fetchone()[0]
 
+    use_sampling = total_rows > MAX_SAMPLE_ROWS
+    table_src = f'(SELECT * FROM "{tname}" LIMIT {MAX_SAMPLE_ROWS})' if use_sampling else f'"{tname}"'
+    sample_size = min(total_rows, MAX_SAMPLE_ROWS) if use_sampling else total_rows
+
     for col in table_schema.columns:
         cname = col.name
-        cur.execute(f"SELECT COUNT(*) FROM \"{tname}\" WHERE \"{cname}\" IS NULL")
-        null_cnt = cur.fetchone()[0]
-        null_rate = round(null_cnt / total_rows, 4) if total_rows > 0 else 0.0
+        cur.execute(f"SELECT COUNT(*) FROM {table_src} WHERE \"{cname}\" IS NULL")
+        sample_null_cnt = cur.fetchone()[0]
+        null_rate = round(sample_null_cnt / sample_size, 4) if sample_size > 0 else 0.0
+        null_cnt = int(round(null_rate * total_rows)) if use_sampling else sample_null_cnt
 
-        cur.execute(f"SELECT COUNT(DISTINCT \"{cname}\") FROM \"{tname}\"")
+        cur.execute(f"SELECT COUNT(DISTINCT \"{cname}\") FROM {table_src}")
         distinct_cnt = cur.fetchone()[0]
 
         # String length and pattern inspection
         cur.execute(
             f"SELECT MIN(LENGTH(CAST(\"{cname}\" AS TEXT))), MAX(LENGTH(CAST(\"{cname}\" AS TEXT))) "
-            f"FROM \"{tname}\" WHERE \"{cname}\" IS NOT NULL"
+            f"FROM {table_src} WHERE \"{cname}\" IS NOT NULL"
         )
         min_len, max_len = cur.fetchone()
 
         # Check for currency symbols, unicode, whitespace padding
         cur.execute(
-            f"SELECT \"{cname}\" FROM \"{tname}\" WHERE \"{cname}\" IS NOT NULL LIMIT 50"
+            f"SELECT \"{cname}\" FROM {table_src} WHERE \"{cname}\" IS NOT NULL LIMIT 50"
         )
         sample_vals = [str(r[0]) for r in cur.fetchall()]
 
@@ -93,7 +106,7 @@ def profile_table(conn: sqlite3.Connection, table_schema: TableSchema, limit_sam
         # Check case-variant duplicates
         cur.execute(
             f"SELECT COUNT(*) FROM ("
-            f"  SELECT LOWER(CAST(\"{cname}\" AS TEXT)) FROM \"{tname}\" "
+            f"  SELECT LOWER(CAST(\"{cname}\" AS TEXT)) FROM {table_src} "
             f"  WHERE \"{cname}\" IS NOT NULL GROUP BY LOWER(CAST(\"{cname}\" AS TEXT)) "
             f"  HAVING COUNT(DISTINCT CAST(\"{cname}\" AS TEXT)) > 1"
             f")"
@@ -107,7 +120,7 @@ def profile_table(conn: sqlite3.Connection, table_schema: TableSchema, limit_sam
             if fk.from_col.lower() == cname.lower():
                 try:
                     cur.execute(
-                        f"SELECT COUNT(*) FROM \"{tname}\" t "
+                        f"SELECT COUNT(*) FROM {table_src} t "
                         f"WHERE t.\"{cname}\" IS NOT NULL "
                         f"AND NOT EXISTS (SELECT 1 FROM \"{fk.to_table}\" r WHERE r.\"{fk.to_col}\" = t.\"{cname}\")"
                     )

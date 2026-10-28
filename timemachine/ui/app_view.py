@@ -1,6 +1,7 @@
 """Streamlit UI view rendering the 5-tab autonomous migration time machine."""
 
 import hashlib
+import json
 import os
 from typing import Any
 
@@ -189,6 +190,30 @@ def render_sidebar():
             "Inject Adversarial Traps",
             value=st.session_state.get("inject_traps", True),
             help="Injects schema-driven edge cases (NULLs, Unicode, orphan keys) on clone.",
+        )
+        st.session_state["sandbox_timeout_s"] = st.slider(
+            "Sandbox Base Timeout (s)",
+            min_value=1.0,
+            max_value=10.0,
+            value=float(st.session_state.get("sandbox_timeout_s", 2.0)),
+            step=0.5,
+            help="Base timeout deadline for sandboxed execution (scales with row count up to 30s).",
+        )
+        st.session_state["max_attempts"] = st.number_input(
+            "Max Attempts Budget",
+            min_value=1,
+            max_value=15,
+            value=int(st.session_state.get("max_attempts", 6)),
+            step=1,
+            help="Maximum verification dry-run attempts.",
+        )
+        st.session_state["agent_wall_clock_timeout_s"] = st.number_input(
+            "Wall Clock Budget (s)",
+            min_value=30,
+            max_value=1200,
+            value=int(st.session_state.get("agent_wall_clock_timeout_s", 300)),
+            step=30,
+            help="Total wall-clock timeout budget for agent execution.",
         )
 
         st.markdown("---")
@@ -476,12 +501,16 @@ def render_run_tab():
             if st.session_state.get("inject_traps", True):
                 setattr(adapter, "inject_traps", True)
 
+            if hasattr(adapter, "settings") and "sandbox_timeout_s" in st.session_state:
+                adapter.settings.sandbox_timeout_s = float(st.session_state["sandbox_timeout_s"])
+
             result = run_time_machine_agent(
                 adapter=adapter,
                 goal=goal_text,
                 spec=spec,
                 target_table=target_t,
                 api_key_override=clean_key,
+                max_steps=int(st.session_state.get("max_attempts", 6)),
                 is_naive_baseline=st.session_state.get("is_naive_baseline", False),
                 progress_callback=on_progress,
             )
@@ -546,6 +575,24 @@ def render_result_tab():
         st.metric("Rollback Status", "✅ Verified" if res.rollback_verified else "❌ Failed")
     with c4:
         st.metric("Est. Lock Duration", f"{res.lock_estimate.get('estimated_lock_sec', 0.0)}s")
+
+    # Attempts Table
+    if getattr(res, "attempts", None):
+        st.subheader("Attempts")
+        attempts_rows = [
+            {
+                "Attempt #": a.attempt,
+                "Model": a.model,
+                "Passed": a.passed_count,
+                "Failed": a.failed_count,
+                "First Failed Check": a.first_failed_check or "-",
+                "Sandbox Error": a.sandbox_error or "None",
+                "Latency": f"{round(a.latency_ms)}ms",
+                "Tokens": a.tokens,
+            }
+            for a in res.attempts
+        ]
+        st.dataframe(attempts_rows, use_container_width=True)
 
     # Transaction-wrapped Forward Script (up.sql)
     wrapped_up = wrap_transaction_with_prechecks(res.up_sql, target_t, res.spec)
@@ -613,6 +660,19 @@ def render_history_tab():
             st.write(f"**Goal:** {h['goal']}")
             st.write(f"**Latency:** {round(h['latency_ms'] / 1000, 2)}s | **Steps:** {h['steps_count']} | **Rollback:** {'Yes' if h['rollback_verified'] else 'No'}")
             st.code(h["up_sql"], language="sql")
+            if h.get("report_json"):
+                try:
+                    rep = json.loads(h["report_json"])
+                    if rep.get("attempts"):
+                        st.markdown("**Attempts & Raw Model Replies:**")
+                        for att in rep["attempts"]:
+                            att_num = att.get("attempt", 1)
+                            att_model = att.get("model", "")
+                            att_raw = (att.get("raw_reply") or "")[:1000]
+                            with st.expander(f"Attempt #{att_num} ({att_model}) Raw Reply", expanded=False):
+                                st.code(att_raw or "(no raw reply)", language="text")
+                except Exception:
+                    pass
 
 
 def render_app():

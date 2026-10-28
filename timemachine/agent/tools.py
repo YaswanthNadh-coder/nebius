@@ -1,9 +1,11 @@
 """OpenAI-style tool definitions and execution registry for agent."""
 
 import json
+import sqlite3
 from typing import Any
 
 from timemachine.adapters.base import DbAdapter
+from timemachine.agent.prompts import format_schema_summary
 from timemachine.traps.profiler import mask_value, profile_table
 from timemachine.verify.invariants import evaluate_migration_invariants
 from timemachine.verify.spec import MigrationSpec
@@ -98,10 +100,29 @@ TOOL_DEFINITIONS = [
 class ToolExecutor:
     """Executes agent tool calls against the database adapter and disposable sandbox."""
 
-    def __init__(self, adapter: DbAdapter, spec: MigrationSpec | None = None, target_table: str = "employees"):
+    def __init__(
+        self,
+        adapter: DbAdapter,
+        spec: MigrationSpec | None = None,
+        target_table: str = "employees",
+        base_snapshot: Any | None = None,
+    ):
         self.adapter = adapter
         self.spec = spec
         self.target_table = target_table
+        self.base_snapshot = base_snapshot
+        self._schema_call_count = 0
+        self._cached_schema: Any | None = None
+        self._cached_schema_summary: str = ""
+        self._profile_cache: dict[str, dict[str, Any]] = {}
+
+    def create_clone(self) -> Any:
+        """Create disposable sandbox clone using fast in-memory backup if snapshot is available."""
+        if self.base_snapshot is not None:
+            c = sqlite3.connect(":memory:", check_same_thread=False)
+            self.base_snapshot.backup(c)
+            return c
+        return self.adapter.clone()
 
     def execute(self, name: str, arguments_json: str) -> dict[str, Any]:
         """Dispatch tool call by name."""
@@ -112,19 +133,37 @@ class ToolExecutor:
 
         try:
             if name == "get_schema":
-                schema = self.adapter.introspect()
-                return {"schema": schema.model_dump()}
+                if self._cached_schema is None:
+                    self._cached_schema = self.adapter.introspect()
+                    self._cached_schema_summary = format_schema_summary(self._cached_schema)
+                if self._schema_call_count > 0:
+                    return {
+                        "note": "Schema already provided in previous round.",
+                        "schema_summary": self._cached_schema_summary,
+                    }
+                self._schema_call_count += 1
+                return {"schema_summary": self._cached_schema_summary}
 
             if name == "profile_table":
                 tname = args.get("table_name", self.target_table)
-                schema = self.adapter.introspect()
-                tbl = schema.get_table(tname)
+                if tname in self._profile_cache:
+                    return {
+                        "note": f"Profile for table '{tname}' already provided.",
+                        "table": tname,
+                        "profiles": self._profile_cache[tname],
+                    }
+                if self._cached_schema is None:
+                    self._cached_schema = self.adapter.introspect()
+                    self._cached_schema_summary = format_schema_summary(self._cached_schema)
+                tbl = self._cached_schema.get_table(tname)
                 if not tbl:
                     return {"error": f"Table '{tname}' not found in database."}
-                clone = self.adapter.clone()
+                clone = self.create_clone()
                 try:
                     prof = profile_table(clone, tbl)
-                    return {"table": tname, "profiles": {k: v.model_dump() for k, v in prof.items()}}
+                    prof_data = {k: v.model_dump() for k, v in prof.items()}
+                    self._profile_cache[tname] = prof_data
+                    return {"table": tname, "profiles": prof_data}
                 finally:
                     clone.close()
 
@@ -137,7 +176,7 @@ class ToolExecutor:
                 except (ValueError, TypeError):
                     limit_val = 5
                 limit = max(1, min(limit_val, 5))
-                clone = self.adapter.clone()
+                clone = self.create_clone()
                 try:
                     cur = clone.cursor()
                     cur.execute(f"SELECT * FROM \"{tname}\" WHERE {pred} LIMIT {limit}")
@@ -160,7 +199,7 @@ class ToolExecutor:
 
                 is_read_query = bool(re.match(r"^\s*(SELECT|PRAGMA|EXPLAIN)\b", up_sql, re.IGNORECASE))
                 if is_read_query:
-                    clone = self.adapter.clone()
+                    clone = self.create_clone()
                     try:
                         cur = clone.cursor()
                         cur.execute(up_sql)
@@ -183,8 +222,8 @@ class ToolExecutor:
                     finally:
                         clone.close()
 
-                base_clone = self.adapter.clone()
-                test_clone = self.adapter.clone()
+                base_clone = self.create_clone()
+                test_clone = self.create_clone()
                 try:
                     ok, err, elapsed = self.adapter.run_in_sandbox(test_clone, up_sql, fk_enabled=True)
                     if not ok:
@@ -224,7 +263,7 @@ class ToolExecutor:
 
             if name == "explain":
                 sql = args.get("sql", "")
-                clone = self.adapter.clone()
+                clone = self.create_clone()
                 try:
                     cur = clone.cursor()
                     cur.execute(f"EXPLAIN QUERY PLAN {sql}")

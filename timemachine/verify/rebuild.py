@@ -1,6 +1,5 @@
 """SQLite 12-step table rebuild procedure and rollback verification."""
 
-import hashlib
 import sqlite3
 from typing import Any
 
@@ -10,25 +9,100 @@ from timemachine.verify.sandbox import apply_sandbox
 logger = get_logger("verify.rebuild")
 
 
+class RollbackVerificationResult(dict):
+    """Result of rollback roundtrip verification.
+
+    Inherits from dict so caller can access result["classification"],
+    result["lossy_columns"], result["sample_diffs"], and unpacks as
+    (rollback_verified, error, lossy_columns) for backwards compatibility.
+    """
+
+    def __init__(
+        self,
+        classification: str,
+        lossy_columns: list[str],
+        sample_diffs: list[dict[str, Any]],
+        error: str | None = None,
+    ):
+        verified = classification in ("EXACT", "EQUIVALENT_AFTER_NORMALIZATION")
+        super().__init__(
+            classification=classification,
+            lossy_columns=lossy_columns,
+            sample_diffs=sample_diffs,
+            rollback_verified=verified,
+            error=error,
+        )
+
+    @property
+    def classification(self) -> str:
+        return self["classification"]
+
+    @property
+    def lossy_columns(self) -> list[str]:
+        return self["lossy_columns"]
+
+    @property
+    def sample_diffs(self) -> list[dict[str, Any]]:
+        return self["sample_diffs"]
+
+    @property
+    def rollback_verified(self) -> bool:
+        return self["rollback_verified"]
+
+    @property
+    def error(self) -> str | None:
+        return self["error"]
+
+    def __iter__(self):
+        yield self.rollback_verified
+        yield self.error
+        yield self.lossy_columns
+
+
 def verify_rollback_roundtrip(
     base_conn: sqlite3.Connection,
     up_sql: str,
     down_sql: str,
     target_table: str,
-) -> tuple[bool, str | None, list[str]]:
-    """Verify that applying up_sql then down_sql returns the database to its exact baseline state."""
+    fk_enabled: bool = True,
+) -> RollbackVerificationResult:
+    """Verify that applying up_sql then down_sql returns the database to its exact baseline state.
+
+    Compares per row by primary key and per column by name (never by position or str(rows)).
+    Classifies result as: EXACT, EQUIVALENT_AFTER_NORMALIZATION, LOSSY, or BROKEN.
+    """
     clone = sqlite3.connect(":memory:", check_same_thread=False)
     base_conn.backup(clone)
     apply_sandbox(clone)
     cur = clone.cursor()
 
-    # Compute baseline checksum for target table
-    b_cur = base_conn.cursor()
-    b_cur.execute(f"SELECT * FROM \"{target_table}\"")
-    b_rows = b_cur.fetchall()
-    orig_checksum = hashlib.sha256(str(b_rows).encode()).hexdigest()
+    # Enforce same foreign keys setting as UP verification
+    cur.execute(f"PRAGMA foreign_keys = {'ON' if fk_enabled else 'OFF'};")
 
-    lossy_columns: list[str] = []
+    # Read baseline table structure and rows
+    b_cur = base_conn.cursor()
+    b_cur.execute(f'PRAGMA table_info("{target_table}")')
+    b_col_info = b_cur.fetchall()
+    if not b_col_info:
+        clone.close()
+        return RollbackVerificationResult(
+            classification="BROKEN",
+            lossy_columns=[],
+            sample_diffs=[],
+            error=f"Target table '{target_table}' not found in baseline schema.",
+        )
+
+    b_cols = [r[1] for r in b_col_info]
+    pk_cols = [r[1] for r in b_col_info if r[5] > 0]
+    pk_col_expr = ", ".join(f'"{c}"' for c in pk_cols) if pk_cols else "rowid"
+
+    b_cur.execute(f'SELECT {pk_col_expr} AS __pk__, * FROM "{target_table}"')
+    b_rows = b_cur.fetchall()
+    orig_rows_by_pk: dict[str, dict[str, Any]] = {}
+    for r in b_rows:
+        row_dict = {col: r[i + 1] for i, col in enumerate(b_cols)}
+        pk_val = str(r[0])
+        orig_rows_by_pk[pk_val] = row_dict
 
     try:
         # Step 1: Apply UP migration
@@ -37,27 +111,111 @@ def verify_rollback_roundtrip(
         # Step 2: Apply DOWN migration
         clone.executescript(down_sql)
 
-        # Step 3: Compare post-rollback state to baseline
-        cur.execute(f"SELECT * FROM \"{target_table}\"")
+        # Step 3: Check restored table schema
+        cur.execute(f'PRAGMA table_info("{target_table}")')
+        down_col_info = cur.fetchall()
+        if not down_col_info:
+            return RollbackVerificationResult(
+                classification="BROKEN",
+                lossy_columns=b_cols,
+                sample_diffs=[],
+                error=f"Target table '{target_table}' was not restored by rollback script.",
+            )
+
+        down_cols = [r[1] for r in down_col_info]
+        missing_cols = [c for c in b_cols if c not in down_cols]
+        if missing_cols:
+            return RollbackVerificationResult(
+                classification="BROKEN",
+                lossy_columns=missing_cols,
+                sample_diffs=[],
+                error=f"Rollback dropped columns: {', '.join(missing_cols)}",
+            )
+
+        # Step 4: Query restored rows
+        cur.execute(f'SELECT {pk_col_expr} AS __pk__, * FROM "{target_table}"')
         down_rows = cur.fetchall()
-        down_checksum = hashlib.sha256(str(down_rows).encode()).hexdigest()
+        restored_rows_by_pk: dict[str, dict[str, Any]] = {}
+        for r in down_rows:
+            row_dict = {col: r[i + 1] for i, col in enumerate(down_cols)}
+            pk_val = str(r[0])
+            restored_rows_by_pk[pk_val] = row_dict
 
-        if orig_checksum != down_checksum:
-            # Check which columns lost data
-            cur.execute(f"PRAGMA table_info(\"{target_table}\")")
-            down_cols = [r[1] for r in cur.fetchall()]
-            b_cur.execute(f"PRAGMA table_info(\"{target_table}\")")
-            b_cols = [r[1] for r in b_cur.fetchall()]
+        if set(orig_rows_by_pk.keys()) != set(restored_rows_by_pk.keys()):
+            diff_keys = set(orig_rows_by_pk.keys()) ^ set(restored_rows_by_pk.keys())
+            return RollbackVerificationResult(
+                classification="BROKEN",
+                lossy_columns=[],
+                sample_diffs=[],
+                error=(
+                    f"Rollback row count mismatch: {len(orig_rows_by_pk)} baseline rows vs "
+                    f"{len(restored_rows_by_pk)} restored rows (differing keys: {list(diff_keys)[:3]})."
+                ),
+            )
 
-            for bc in b_cols:
-                if bc not in down_cols:
-                    lossy_columns.append(bc)
+        # Step 5: Compare per row by primary key and per column by name
+        has_whitespace_only_diff = False
+        has_lossy_diff = False
+        lossy_columns: list[str] = []
+        sample_diffs: list[dict[str, Any]] = []
 
-            return False, "ROUNDTRIP_CHECKSUM_MISMATCH: Rollback did not fully restore original row state.", lossy_columns
+        for pk_val, orig_row in orig_rows_by_pk.items():
+            rest_row = restored_rows_by_pk[pk_val]
+            for col in b_cols:
+                orig_val = orig_row.get(col)
+                rest_val = rest_row.get(col)
 
-        return True, None, []
+                if orig_val == rest_val:
+                    continue
+
+                # Check if difference is only leading/trailing whitespace
+                if isinstance(orig_val, str) and isinstance(rest_val, str) and orig_val.strip() == rest_val.strip():
+                    has_whitespace_only_diff = True
+                else:
+                    has_lossy_diff = True
+                    if col not in lossy_columns:
+                        lossy_columns.append(col)
+                    if len(sample_diffs) < 3:
+                        sample_diffs.append({
+                            "pk": pk_val,
+                            "column": col,
+                            "original": orig_val,
+                            "restored": rest_val,
+                        })
+
+        if has_lossy_diff:
+            diff_summary = "; ".join(
+                [f"PK {d['pk']} col {d['column']}: {d['original']!r} -> {d['restored']!r}" for d in sample_diffs]
+            )
+            return RollbackVerificationResult(
+                classification="LOSSY",
+                lossy_columns=lossy_columns,
+                sample_diffs=sample_diffs,
+                error=f"Rollback modified values in columns {lossy_columns}: {diff_summary}",
+            )
+
+        if has_whitespace_only_diff:
+            return RollbackVerificationResult(
+                classification="EQUIVALENT_AFTER_NORMALIZATION",
+                lossy_columns=[],
+                sample_diffs=[],
+                error=None,
+            )
+
+        return RollbackVerificationResult(
+            classification="EXACT",
+            lossy_columns=[],
+            sample_diffs=[],
+            error=None,
+        )
+
     except Exception as exc:
-        return False, f"ROLLBACK_EXECUTION_ERROR: {exc}", []
+        return RollbackVerificationResult(
+            classification="BROKEN",
+            lossy_columns=[],
+            sample_diffs=[],
+            error=f"ROLLBACK_EXECUTION_ERROR: {exc}",
+        )
     finally:
         clone.close()
 
@@ -77,7 +235,6 @@ def estimate_production_lock_time(
         }
 
     ratio = max(1.0, production_rows / clone_rows)
-    # Estimate with slight O(N log N) scaling factor for index rebuilds
     scaled_ms = clone_elapsed_ms * ratio * 1.15
     scaled_sec = round(scaled_ms / 1000, 2)
 

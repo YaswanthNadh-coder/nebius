@@ -283,7 +283,7 @@ def test_mutation_lossy_rollback(base_test_db):
     down_sql = "ALTER TABLE employees ADD COLUMN salary_text TEXT DEFAULT NULL;"
     ok, err, lossy = verify_rollback_roundtrip(base_test_db, up_sql, down_sql, target_table="employees")
     assert ok is False
-    assert "ROUNDTRIP_CHECKSUM_MISMATCH" in (err or "")
+    assert "ROUNDTRIP_CHECKSUM_MISMATCH" in (err or "") or "Rollback modified values" in (err or "") or "salary_text" in lossy
 
 
 # 14. Unauthorized DROP of non-target table

@@ -1,9 +1,9 @@
-"""Prompt templates for planning, drafting, and repairing schema migrations."""
-
-import json
+"""Prompt templates for drafting and repairing schema migrations with transform contracts and gotchas."""
 
 from timemachine.adapters.schema import DatabaseSchema
+from timemachine.verify import oracle
 from timemachine.verify.invariants import InvariantResult
+from timemachine.verify.sandbox import ALLOWED_PRAGMAS
 from timemachine.verify.spec import MigrationSpec
 
 
@@ -42,65 +42,138 @@ def format_schema_summary(schema: DatabaseSchema) -> str:
     return "\n".join(lines)
 
 
-def build_plan_prompt(schema: DatabaseSchema, goal: str, profiles: dict | None = None) -> str:
-    """Build prompt asking model to generate a structured MigrationSpec JSON."""
-    schema_text = format_schema_summary(schema)
-    profile_summary = ""
-    if profiles:
-        profile_summary = f"\nData Profile Summary (Masked):\n{json.dumps(profiles, indent=2, default=str)}"
+def generate_transform_contract(spec: MigrationSpec) -> str:
+    """Generate transform contract from the spec using exact docstrings from oracle.py."""
+    if not spec.column_mappings:
+        return ""
 
-    return f"""You are an expert database migration architect.
-Your task is to analyze the database schema and migration goal, then output a structured MigrationSpec in JSON.
+    lines = ["Transform Contract (exact reference oracle verification rules):"]
+    for tname, mappings in spec.column_mappings.items():
+        lines.append(f"Table {tname}:")
+        for m in mappings:
+            trans_name = (m.transform or "passthrough").lower()
+            # Map aliases to oracle function names
+            func_name = trans_name
+            if trans_name in ("first_name",):
+                func_name = "split_name_first"
+            elif trans_name in ("last_name",):
+                func_name = "split_name_last"
+            elif trans_name in ("clean_name",):
+                func_name = "strip_honorific"
+            elif trans_name in ("integer",):
+                func_name = "cast_int"
+            elif trans_name in ("cents",):
+                func_name = "cast_cents"
+            elif trans_name in ("coalesce",):
+                func_name = "default_if_null"
+            elif trans_name in ("lookup",):
+                func_name = "map_via_lookup"
+            elif trans_name in ("date",):
+                func_name = "normalize_date"
+            elif trans_name in ("identity",):
+                func_name = "passthrough"
 
-Database Schema:
-{schema_text}
-{profile_summary}
+            fn = getattr(oracle, func_name, None)
+            doc = fn.__doc__.strip() if fn and fn.__doc__ else f"Apply {trans_name} transform."
+            src_str = f" from {m.source_column}" if m.source_column else ""
+            def_str = f" (default: {m.default_value!r})" if m.default_value is not None else ""
+            lines.append(f"- {m.new_column}{src_str} [transform: {trans_name}{def_str}]: {doc}")
 
-Migration Goal:
-{goal}
+    return "\n".join(lines)
 
-Rules for MigrationSpec JSON:
-1. `affected_tables`: List of tables modified or created.
-2. `column_mappings`: For each affected table, list of objects:
-   - `new_column`: name of target column.
-   - `source_column`: original column name (or null if computed).
-   - `transform`: one of ["passthrough", "split_name_first", "split_name_last", "strip_honorific", "cast_int", "cast_cents", "default_if_null", "map_via_lookup", "normalize_date", "salary_band", "custom"].
-   - `null_policy`: "not_null" or "nullable".
-   - `default_value`: fallback default value if null.
-   - `lookup_table`: lookup table name if transform is map_via_lookup.
-   - `lookup_key`: lookup code column.
-   - `lookup_val`: lookup target column.
-3. `row_policy`: "preserve_all" (zero row loss) or "deletions_allowed".
-4. `columns_declared_unchanged`: mapping of table name to columns whose row data must not be touched.
-5. `expected_constraints`: table constraints to enforce (e.g. PRIMARY KEY, UNIQUE, NOT NULL).
-6. `risky_operations`: any destructive operations needed (e.g. DROP TABLE old).
 
-Return ONLY the JSON object inside a ```json ``` block."""
+def get_sqlite_gotchas_block() -> str:
+    """Generate concise SQLite gotchas block."""
+    permitted = ", ".join(sorted(ALLOWED_PRAGMAS))
+    return f"""SQLite Gotchas & Execution Rules:
+- TRIM(x) only removes standard spaces; to strip tabs, newlines, and carriage returns, use: TRIM(x, ' ' || char(9) || char(10) || char(13))
+- INSTR(string, substring) returns 0 when substring is not found (1-indexed).
+- Concatenating with NULL produces NULL (e.g. 'a' || NULL is NULL); use COALESCE(col, '').
+- SQLite has no built-in REGEXP operator.
+- AUTOINCREMENT requires proper sqlite_sequence handling during table rebuilds.
+- Recreate all indexes, triggers, and views after a table rebuild.
+- Only the following permitted PRAGMAs may be used on the in-memory clone: {permitted}.
+"""
+
+
+def build_dynamic_task_checklist(result: InvariantResult | None) -> list[str]:
+    """Dynamically construct task checklist from failed check types rather than scenario-specific advice."""
+    checklist: list[str] = []
+    if not result or not result.failed_checks:
+        checklist.append("Ensure schema modifications match the approved specification.")
+        checklist.append("Provide both complete UP migration and DOWN rollback migration.")
+        return checklist
+
+    failed_text = " ".join(result.failed_checks).upper()
+
+    # 1. Row loss
+    if "ROW_LOSS" in failed_text or "ROW_COUNT" in failed_text or "LOST_ROW" in failed_text or "ROW LOSS" in failed_text:
+        checklist.append(
+            "Fix row loss: ensure zero silent row drops by using LEFT JOIN and COALESCE so unmatched records or orphan foreign keys default safely without losing records."
+        )
+
+    # 2. Indexes
+    if "INDEX" in failed_text or "LOST_INDEX" in failed_text:
+        checklist.append("Recreate all pre-existing and declared indexes on the target table after rebuilding.")
+
+    # 3. Triggers and Views
+    if "TRIGGER" in failed_text or "VIEW" in failed_text:
+        checklist.append("Recreate all pre-existing views and triggers that depend on the rebuilt table.")
+
+    # 4. Data Mismatch
+    if "DATA_MISMATCH" in failed_text or "MISMATCH" in failed_text or "ORACLE" in failed_text:
+        checklist.append(
+            "Fix data mismatch: compare actual output against the Transform Contract. Use TRIM(x, ' ' || char(9) || char(10) || char(13)) to handle whitespace and verify splitting boundaries."
+        )
+
+    # 5. Sandbox Violations
+    if "SANDBOX VIOLATION" in failed_text or "NOT PERMITTED" in failed_text or "AUTHORIZ" in failed_text:
+        permitted = ", ".join(sorted(ALLOWED_PRAGMAS))
+        checklist.append(
+            f"Fix sandbox violation: avoid ATTACH, DETACH, VACUUM, and load_extension. Only the following permitted PRAGMAs may be used: {permitted}."
+        )
+
+    # 6. Constraint Violations
+    if "NOT NULL" in failed_text or "CONSTRAINT" in failed_text or "CHECK" in failed_text:
+        checklist.append("Fix constraint violations: ensure columns with NOT NULL constraints have valid values or DEFAULT fallbacks.")
+
+    # 7. General baseline requirement
+    if not checklist:
+        checklist.append("Fix the execution error or constraint violation reported in the failure telemetry.")
+
+    checklist.append("Provide both complete UP migration and DOWN rollback migration inside ```sql blocks.")
+    return checklist
 
 
 def build_migration_prompt(
     schema: DatabaseSchema,
     spec: MigrationSpec,
     is_naive_baseline: bool = False,
+    max_tool_calls: int = 6,
 ) -> str:
     """Build prompt for generating up.sql and down.sql."""
     schema_text = format_schema_summary(schema)
     spec_json = spec.model_dump_json(indent=2)
+    contract_text = generate_transform_contract(spec)
+    gotchas_text = get_sqlite_gotchas_block()
 
-    instruction = (
-        "Write a complete, safe, production-grade SQLite migration script.\n"
-        "Requirements:\n"
-        "1. Rebuild tables following SQLite standard 12-step table rebuild (create new table, copy data, drop old, rename, recreate indexes/triggers/views).\n"
-        "2. Zero silent row drops: Use LEFT JOIN and COALESCE so dirty foreign keys or unmapped codes default safely without losing records.\n"
-        "3. Output BOTH ```sql -- UP MIGRATION ``` and ```sql -- DOWN MIGRATION (ROLLBACK) ```.\n"
-        "4. You can use available tools (get_schema, profile_table, find_violating_rows, run_on_clone) to inspect data or test candidate fixes on the disposable sandbox clone.\n"
-        "5. When complete, call the submit tool or provide the migration scripts inside ```sql blocks."
-    )
     if is_naive_baseline:
         instruction = (
             "Write a standard first-pass naive migration script using INNER JOIN (as a baseline test).\n"
             "Output the migration script inside a ```sql ``` block."
         )
+    else:
+        instruction = (
+            "Write a complete, safe, production-grade SQLite migration script.\n"
+            "Requirements:\n"
+            "1. Rebuild tables following SQLite standard 12-step table rebuild (create new table, copy data, drop old, rename, recreate indexes/triggers/views).\n"
+            "2. Preserve all data records without silent drops.\n"
+            "3. Output BOTH ```sql -- UP MIGRATION ``` and ```sql -- DOWN MIGRATION (ROLLBACK) ```.\n"
+            f"4. The schema is already above; do not call get_schema. You have at most {max_tool_calls} tool calls; finish with submit.\n"
+            "5. When complete, call the submit tool or provide the migration scripts inside ```sql blocks."
+        )
+
+    contract_section = f"\n{contract_text}\n" if contract_text else ""
 
     return f"""You are a database migration engineer writing SQLite migration SQL.
 
@@ -109,7 +182,8 @@ Current Database Schema:
 
 Approved Migration Plan (MigrationSpec):
 {spec_json}
-
+{contract_section}
+{gotchas_text}
 {instruction}
 """
 
@@ -120,16 +194,24 @@ def build_repair_prompt(
     failed_sql: str,
     result: InvariantResult | None = None,
     trap_results: list[dict] | None = None,
+    max_tool_calls: int = 6,
 ) -> str:
-    """Build repair prompt with structured failure telemetry."""
+    """Build repair prompt with structured failure telemetry, transform contract, and dynamic checklist."""
     schema_text = format_schema_summary(schema)
+    contract_text = generate_transform_contract(spec)
+    gotchas_text = get_sqlite_gotchas_block()
+
+    tool_instruction = f"The schema is already above; do not call get_schema. You have at most {max_tool_calls} tool calls; finish with submit."
+
     if result is None:
         truncated_reply = (failed_sql or "")[:500]
         return f"""You are a database migration engineer writing SQLite migration SQL.
 
 Target Schema:
 {schema_text}
+
 your previous reply contained no executable SQL (reply was: {truncated_reply}); reply with the migration.
+{tool_instruction}
 
 Output the complete, corrected SQLite migration inside a ```sql ``` block with both UP and DOWN migrations, or call submit."""
 
@@ -141,6 +223,10 @@ Output the complete, corrected SQLite migration inside a ```sql ``` block with b
             traps_text = "\nFailed Adversarial Traps:\n" + "\n".join(
                 [f"- Trap {t.get('trap_type')}: {t.get('description')} (pk={t.get('pk')})" for t in failing_traps]
             )
+
+    checklist_items = build_dynamic_task_checklist(result)
+    checklist_text = "\n".join([f"{i + 1}. {item}" for i, item in enumerate(checklist_items)])
+    contract_section = f"\n{contract_text}\n" if contract_text else ""
 
     return f"""The previous SQLite schema migration failed dry-run verification on the sandbox clone.
 
@@ -157,13 +243,11 @@ Row Counts: Before={result.before_count}, After={result.after_count}
 Failed Checks:
 {failed_checks_text}
 {traps_text}
-
+{contract_section}
+{gotchas_text}
 Task:
 Analyze the exact failure points above and write a complete, corrected, lossless SQLite migration.
-1. Fix row loss or duplication (use LEFT JOIN and COALESCE for unmatched foreign keys).
-2. Fix any missing columns or violated NOT NULL constraints.
-3. Recreate all pre-existing indexes, views, and triggers.
-4. Provide both UP migration and DOWN rollback migration.
+{checklist_text}
 
-You may use available tools (get_schema, profile_table, find_violating_rows, run_on_clone) to inspect the data or test candidate fixes on the sandbox clone.
+{tool_instruction}
 When complete, call the submit tool or return the corrected scripts in ```sql blocks with both UP and DOWN migrations."""

@@ -53,6 +53,9 @@ Database Schema:
 Migration Goal:
 {goal}
 
+Transform Contract & Whitespace Agreement:
+The reference oracle normalizes string fields using Python str.strip() (stripping all ASCII and Unicode whitespace, including tabs and newlines).
+
 Target JSON Schema:
 {json_schema_str}
 

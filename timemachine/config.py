@@ -143,6 +143,10 @@ class Settings(BaseModel):
         default=8,
         description="Maximum agent tool-calling steps budget",
     )
+    max_attempts: int = Field(
+        default=6,
+        description="Maximum migration verification attempts",
+    )
     max_llm_tokens: int = Field(
         default=8192,
         description="Maximum completion tokens per LLM invocation",
@@ -156,8 +160,12 @@ class Settings(BaseModel):
         description="Maximum total wall-clock budget in seconds for an agent execution run",
     )
     max_tool_rounds_per_step: int = Field(
-        default=10,
+        default=6,
         description="Maximum tool calling rounds per step",
+    )
+    reasoning_effort: str | None = Field(
+        default=None,
+        description="Optional reasoning effort setting ('low', 'medium', 'high') or thinking switch for Nemotron",
     )
 
 

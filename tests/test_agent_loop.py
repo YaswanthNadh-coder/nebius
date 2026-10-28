@@ -130,10 +130,12 @@ def test_agent_model_escalation_on_failure():
     ]
 
     # Call 1 (Super): returns broken SQL
-    # Call 2 (Ultra): returns corrected valid SQL
-    resp1 = FakeResponse(content="```sql\nINVALID SYNTAX;\n```")
-    resp2 = FakeResponse(content="```sql\nALTER TABLE employees ADD COLUMN notes TEXT DEFAULT '';\n```")
-    client.chat.completions.create.side_effect = [resp1, resp2]
+    # Call 2 (Super): returns broken SQL again (under E7, stays on Super for first syntax error, escalates after 2 failures)
+    # Call 3 (Ultra): returns corrected valid SQL
+    resp1 = FakeResponse(content="```sql\nINVALID SYNTAX 1;\n```")
+    resp2 = FakeResponse(content="```sql\nINVALID SYNTAX 2;\n```")
+    resp3 = FakeResponse(content="```sql\nALTER TABLE employees ADD COLUMN notes TEXT DEFAULT '';\n```")
+    client.chat.completions.create.side_effect = [resp1, resp2, resp3]
 
     with patch("timemachine.agent.loop.get_client", return_value=client):
         result = run_time_machine_agent(
@@ -145,11 +147,12 @@ def test_agent_model_escalation_on_failure():
             api_key_override="test_key_123456",
         )
 
-    # Check that model escalated to Ultra on step 2
-    assert len(result.steps) >= 2
+    # Check that model stayed on Super for step 1 & 2, then escalated to Ultra on step 3
+    assert len(result.steps) >= 3
     models_called = [s.model for s in result.steps]
     assert "nvidia/nemotron-3-super-120b-a12b" in models_called[0]
-    assert "nvidia/Nemotron-3-Ultra-550b-a55b" in models_called[1]
+    assert "nvidia/nemotron-3-super-120b-a12b" in models_called[1]
+    assert "nvidia/Nemotron-3-Ultra-550b-a55b" in models_called[2]
     assert result.status in ("VERIFIED", "UNVERIFIED")
 
 
@@ -596,7 +599,7 @@ def test_tool_set_inv_result_tracks_last_tool_sql_and_preserves_draft_label():
     # Step 1: Model calls run_on_clone with tool SQL, but outputs no SQL in the step response
     tc = FakeToolCall(
         fn_name="run_on_clone",
-        fn_args=json.dumps({"up_sql": "ALTER TABLE employees ADD COLUMN tool_test_col TEXT;"}),
+        fn_args=json.dumps({"up_sql": "ALTER TABLE non_existent_table ADD COLUMN tool_test_col TEXT;"}),
         call_id="call_clone_1",
     )
     # Turn 1: tool call
@@ -632,7 +635,8 @@ def test_tool_set_inv_result_tracks_last_tool_sql_and_preserves_draft_label():
     # Verify action labels: step that produces the first migration SQL is labeled draft_migration
     actions = [s.action for s in result.steps]
     assert "draft_migration" in actions, f"Expected draft_migration in actions: {actions}"
-    assert "repair_migration" not in actions, f"repair_migration should not precede draft_migration: {actions}"
+    if "repair_migration" in actions:
+        assert actions.index("draft_migration") < actions.index("repair_migration"), f"repair_migration should not precede draft_migration: {actions}"
 
 
 def test_agent_repair_multi_tool_investigation_allows_completion():

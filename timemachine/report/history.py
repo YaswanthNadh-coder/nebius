@@ -51,6 +51,7 @@ def save_run_history(
         report_data = {
             "status": result.status,
             "steps": [s.model_dump() for s in result.steps],
+            "attempts": [a.model_dump() for a in getattr(result, "attempts", [])],
             "lock_estimate": result.lock_estimate,
             "lossy_columns": result.lossy_columns,
             "rollback_error": result.rollback_error,

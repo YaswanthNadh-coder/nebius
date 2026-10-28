@@ -161,6 +161,8 @@ def call_llm(
         kwargs["tools"] = tools
     if timeout is not None:
         kwargs["timeout"] = timeout
+    if getattr(settings, "reasoning_effort", None):
+        kwargs["reasoning_effort"] = settings.reasoning_effort
 
     try:
         resp = client.chat.completions.create(**kwargs)

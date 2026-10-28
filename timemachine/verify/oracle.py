@@ -19,8 +19,13 @@ _SUFFIXES = re.compile(
 )
 
 
+def passthrough(val: Any) -> Any:
+    """Preserve source column value without alteration."""
+    return val
+
+
 def strip_honorific(val: Any) -> str:
-    """Strip title prefixes and credential suffixes from name string."""
+    """Strip title prefixes and credential suffixes from name string after stripping all whitespace with Python str.strip()."""
     if val is None:
         return ""
     s = str(val).strip()
@@ -30,7 +35,7 @@ def strip_honorific(val: Any) -> str:
 
 
 def split_name_first(val: Any) -> str:
-    """Extract first name (before first space of trimmed string)."""
+    """Strip ALL whitespace (including tab/newline with Python str.strip()), then take text before the first space."""
     if val is None:
         return ""
     s = str(val).strip()
@@ -42,7 +47,7 @@ def split_name_first(val: Any) -> str:
 
 
 def split_name_last(val: Any, default: str = "N/A") -> str:
-    """Extract last name (remainder after first space of trimmed string), or default for mononym."""
+    """Remainder after the first space (stripped of all whitespace with Python str.strip()), or the default 'N/A' for single-word names."""
     if val is None:
         return default
     s = str(val).strip()
@@ -55,7 +60,7 @@ def split_name_last(val: Any, default: str = "N/A") -> str:
 
 
 def cast_int(val: Any, default: int = 0) -> int:
-    """Parse integer, safely stripping currency symbols, commas, and whitespace."""
+    """Parse integer, safely stripping currency symbols ($/€/£), commas, and all whitespace with Python str.strip()."""
     if val is None:
         return default
     s = str(val).strip()
@@ -77,7 +82,7 @@ def cast_int(val: Any, default: int = 0) -> int:
 
 
 def cast_cents(val: Any, default: int = 0) -> int:
-    """Convert currency float/string to integer cents (e.g. 14.99 -> 1499)."""
+    """Convert currency float/string to integer cents (e.g. 14.99 -> 1499), stripping currency symbols and all whitespace with Python str.strip()."""
     if val is None:
         return default
     s = str(val).strip().replace("$", "").replace(",", "").replace(" ", "")
@@ -136,7 +141,7 @@ def normalize_date(val: Any) -> str:
 
 
 def trim_case(val: Any, mode: str = "trim") -> str:
-    """Apply trim, lower, or upper string transformations."""
+    """Apply trim, lower, or upper string transformations after stripping all whitespace with Python str.strip()."""
     if val is None:
         return ""
     s = str(val).strip()
@@ -145,6 +150,16 @@ def trim_case(val: Any, mode: str = "trim") -> str:
     if mode == "upper":
         return s.upper()
     return s
+
+
+def salary_band(val: Any) -> str:
+    """Categorize integer salary into bands: 'HIGH' for >= 100000, 'MID' for >= 60000, else 'LOW'."""
+    num = cast_int(val, default=0)
+    if num >= 100000:
+        return "HIGH"
+    elif num >= 60000:
+        return "MID"
+    return "LOW"
 
 
 def compute_oracle_row(
