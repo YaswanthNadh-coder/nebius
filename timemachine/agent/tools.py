@@ -8,7 +8,10 @@ from timemachine.adapters.base import DbAdapter
 from timemachine.agent.llm import has_ddl_or_dml
 from timemachine.agent.prompts import format_schema_summary
 from timemachine.traps.profiler import mask_value, profile_table
-from timemachine.verify.invariants import evaluate_migration_invariants
+from timemachine.verify.invariants import (
+    audit_null_crash_diagnostics,
+    evaluate_migration_invariants,
+)
 from timemachine.verify.spec import MigrationSpec
 
 TOOL_DEFINITIONS = [
@@ -245,12 +248,17 @@ class ToolExecutor:
                 try:
                     ok, err, elapsed = self.adapter.run_in_sandbox(test_clone, up_sql, fk_enabled=True)
                     if not ok:
+                        err_msg = err or "Execution error"
+                        diag = audit_null_crash_diagnostics(
+                            base_clone, self.target_table, err_msg, current_sql=up_sql, spec=self.spec
+                        )
+                        full_err = f"{err_msg}{diag}"
                         return {
                             "status": "FAILED",
                             "passed": False,
-                            "error": err,
+                            "error": full_err,
                             "elapsed_ms": elapsed,
-                            "failed_checks": [err],
+                            "failed_checks": [full_err],
                         }
 
                     inv = evaluate_migration_invariants(

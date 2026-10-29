@@ -16,7 +16,7 @@ def format_schema_summary(schema: DatabaseSchema) -> str:
         cols_desc = []
         for c in tbl.columns:
             pk_tag = " PRIMARY KEY" if c.pk else ""
-            nn_tag = " NOT NULL" if c.notnull else ""
+            nn_tag = " NOT NULL" if c.notnull else " NULLABLE"
             def_tag = f" DEFAULT {c.default}" if c.default is not None else ""
             cols_desc.append(f"  {c.name} {c.type}{pk_tag}{nn_tag}{def_tag}")
 
@@ -89,6 +89,7 @@ def get_sqlite_gotchas_block() -> str:
     """Generate concise SQLite gotchas block."""
     permitted = ", ".join(sorted(ALLOWED_PRAGMAS))
     return f"""SQLite Gotchas & Execution Rules:
+- CRITICAL RULE FOR TABLE REBUILDS (CREATE TABLE ..._new): Preserve the exact nullability of every existing column from the original CREATE TABLE DDL. NEVER add NOT NULL to an existing nullable column (such as salary, created_at, etc.) unless the migration goal explicitly asks to make that specific column NOT NULL. Whenever any target column IS declared NOT NULL, you MUST wrap its corresponding SELECT expression in COALESCE(column_name, <sensible_default_matching_type>) for ALL such columns at once.
 - In 12-step table rebuilds, map orphan keys according to orphan_policy before inserting; never disable enforcement to hide violations. Always execute 'PRAGMA foreign_key_check;' before 'COMMIT;'.
 - In 'CREATE TABLE target_new (...)', preserve the EXACT column nullability and defaults from the original schema for all untouched columns (e.g. if salary was nullable in the original schema, it MUST remain nullable; do NOT add NOT NULL to columns that were not originally NOT NULL).
 - In 'INSERT INTO target_new (...) SELECT ... FROM target', explicitly list ALL columns in both INSERT and SELECT clauses (including untouched columns like id, salary, created_at). Never omit untouched columns or SQLite will fail NOT NULL constraints.
@@ -161,12 +162,15 @@ def build_dynamic_task_checklist(result: InvariantResult | None) -> list[str]:
 
     # 9. NOT NULL or General Constraint Violations
     if "NOT NULL" in failed_text or "CONSTRAINT" in failed_text or "CHECK" in failed_text:
+        checklist.append(
+            "CRITICAL RULE FOR TABLE REBUILDS: Preserve the exact nullability of every existing column from the original CREATE TABLE DDL. NEVER add NOT NULL to an existing nullable column (such as salary, created_at, etc.) unless the migration goal explicitly asks to make that specific column NOT NULL. Whenever any target column IS declared NOT NULL, you MUST wrap its corresponding SELECT expression in COALESCE(column_name, <sensible_default_matching_type>) for ALL such columns at once."
+        )
         import re
         nn_match = re.search(r"NOT NULL constraint failed:\s*([\w\.]+)", " ".join(result.failed_checks))
         col_name = nn_match.group(1) if nn_match else None
         if col_name:
             checklist.append(
-                f"Fix NOT NULL constraint failure on '{col_name}': explicitly include '{col_name}' in BOTH the 'INSERT INTO target_new (..., {col_name}, ...)' column list and the 'SELECT ..., {col_name}, ... FROM target' data copy query. Check the original schema: if '{col_name}' was nullable originally, ensure it is nullable in target_new."
+                f"Fix NOT NULL constraint failure on '{col_name}': check the original schema and MULTI-COLUMN NOT NULL DIAGNOSTIC. If '{col_name}' (or any other column with NULLs) was nullable originally, ensure it is defined as NULLABLE in target_new."
             )
         else:
             checklist.append(
@@ -203,9 +207,15 @@ def build_migration_prompt(
                 tot = getattr(cp, "total_rows", 0) if not isinstance(cp, dict) else cp.get("total_rows", 0)
                 ms = getattr(cp, "masked_sample", []) if not isinstance(cp, dict) else cp.get("masked_sample", [])
                 sample_str = f" | Samples: {ms}" if ms else ""
-                p_lines.append(f"- {tbl_name}.{c_name}: {nc}/{tot} NULL rows{sample_str}")
+                is_null = getattr(cp, "is_nullable", True) if not isinstance(cp, dict) else cp.get("is_nullable", True)
+                null_badge = " [NULLABLE IN BASELINE]" if is_null else " [NOT NULL IN BASELINE]"
+                p_lines.append(f"- {tbl_name}.{c_name}{null_badge}: {nc}/{tot} NULL rows{sample_str}")
         if p_lines:
-            profile_section = "\nData Profile & Masked Sample Facts:\n" + "\n".join(p_lines) + "\n"
+            profile_section = (
+                "\nData Profile & Masked Sample Facts:\n"
+                + "\n".join(p_lines)
+                + "\n⚠️ WARNING: Synthetic adversarial trap rows contain NULL values in EVERY nullable baseline column.\n"
+            )
 
     if is_naive_baseline:
         instruction = (
@@ -220,7 +230,7 @@ def build_migration_prompt(
             "2. Preserve all data records without silent drops.\n"
             "3. Output BOTH ```sql -- UP MIGRATION ``` and ```sql -- DOWN MIGRATION (ROLLBACK) ```.\n"
             f"4. The schema is already above; do not call get_schema. You have at most {max_tool_calls} tool calls; finish with submit.\n"
-            "5. In the new table definition, preserve the EXACT column nullability and defaults from the original schema for all untouched columns (e.g. if salary was nullable originally, keep it nullable; do NOT add NOT NULL).\n"
+            "5. CRITICAL RULE FOR TABLE REBUILDS (CREATE TABLE ..._new): Preserve the exact nullability of every existing column from the original CREATE TABLE DDL. NEVER add NOT NULL to an existing nullable column (such as salary, created_at, etc.) unless the migration goal explicitly asks to make that specific column NOT NULL. Whenever any target column IS declared NOT NULL, you MUST wrap its corresponding SELECT expression in COALESCE(column_name, <sensible_default_matching_type>) for ALL such columns at once.\n"
             "6. In the INSERT INTO target_new (...) SELECT ... FROM target statement, explicitly list every column name in both the INSERT and SELECT clauses.\n"
             "7. When complete, call the submit tool or provide the migration scripts inside ```sql blocks."
         )
@@ -298,6 +308,7 @@ Target Schema:
 {schema_text}
 
 {history_block}
+{gotchas_text}
 your previous reply contained no executable SQL (reply was: {truncated_reply}); reply with the migration.
 {tool_instruction}
 
@@ -334,6 +345,7 @@ Failed Checks:
 {gotchas_text}
 Task:
 Analyze the exact failure points above and write a complete, corrected, lossless SQLite migration.
+CRITICAL RULE FOR TABLE REBUILDS (CREATE TABLE ..._new): Preserve the exact nullability of every existing column from the original CREATE TABLE DDL. NEVER add NOT NULL to an existing nullable column (such as salary, created_at, etc.) unless the migration goal explicitly asks to make that specific column NOT NULL. Whenever any target column IS declared NOT NULL, you MUST wrap its corresponding SELECT expression in COALESCE(column_name, <sensible_default_matching_type>) for ALL such columns at once.
 {checklist_text}
 
 {tool_instruction}

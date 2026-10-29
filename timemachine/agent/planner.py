@@ -65,6 +65,7 @@ Rules for MigrationSpec formulation:
    - Untouched / preserved columns (e.g. unchanged primary keys, dates, numbers) must be listed under `columns_declared_unchanged`.
    - Valid transform types: 'passthrough', 'split_name_first', 'split_name_last', 'strip_honorific', 'cast_int', 'cast_cents', 'default_if_null', 'map_via_lookup', 'normalize_date', 'salary_band', 'trim', 'lower', 'upper'.
 2. Null Policy:
+   - CRITICAL RULE FOR TABLE REBUILDS (CREATE TABLE ..._new): Preserve the exact nullability of every existing column from the original CREATE TABLE DDL. NEVER add NOT NULL to an existing nullable column (such as salary, created_at, etc.) unless the migration goal explicitly asks to make that specific column NOT NULL. Whenever any target column IS declared NOT NULL, you MUST wrap its corresponding SELECT expression in COALESCE(column_name, <sensible_default_matching_type>) for ALL such columns at once.
    - Set null_policy to 'not_null' ONLY for columns that are NOT NULL in the baseline schema or explicitly required to be non-nullable by the migration goal (such as split first_name and last_name).
    - Columns that are nullable in the source schema (e.g. department, salary, created_at) MUST have null_policy set to 'nullable'.
 3. Constraints:

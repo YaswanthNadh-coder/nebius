@@ -493,3 +493,94 @@ def evaluate_migration_invariants(
         oracle_verified=oracle_verified,
         is_sampled=is_sampled,
     )
+
+
+def audit_null_crash_diagnostics(
+    base_conn: sqlite3.Connection,
+    target_table: str,
+    err_msg: str,
+    current_sql: str = "",
+    spec: MigrationSpec | None = None,
+) -> str:
+    """Audit all columns in target_table containing NULLs when a NOT NULL constraint crashes.
+
+    Identifies all vulnerable columns in the source table that contain NULLs (including synthetic traps),
+    checks which columns in the migration SQL are declared NOT NULL, and returns an explicit
+    multi-column diagnostic instruction to fix all vulnerable columns in a single repair turn.
+    """
+    if "not null constraint failed" not in err_msg.lower():
+        return ""
+
+    try:
+        cur = base_conn.cursor()
+        cur.execute(f'PRAGMA table_info("{target_table}")')
+        base_cols = cur.fetchall()  # (cid, name, type, notnull, dflt_value, pk)
+        if not base_cols:
+            return ""
+
+        # 1. Identify baseline nullability (notnull == 0 and pk == 0)
+        baseline_nullable = {r[1]: (r[3] == 0 and r[5] == 0) for r in base_cols}
+
+        # 2. Query source table for all columns containing NULLs
+        null_columns: dict[str, int] = {}
+        for r in base_cols:
+            cname = r[1]
+            try:
+                cur.execute(f'SELECT COUNT(*) FROM "{target_table}" WHERE "{cname}" IS NULL')
+                cnt = cur.fetchone()[0]
+                if cnt > 0:
+                    null_columns[cname] = cnt
+            except Exception:
+                pass
+
+        # 3. Parse target table CREATE TABLE statement in current_sql to find declared NOT NULL columns
+        declared_not_null_cols: set[str] = set()
+        if current_sql:
+            tbl_re = re.compile(
+                r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[\"']?([a-zA-Z0-9_]+)[\"']?\s*\((.*?)\)(?:;|\s*$|\n\s*[A-Z])",
+                re.IGNORECASE | re.DOTALL,
+            )
+            for m in tbl_re.finditer(current_sql):
+                created_tname = m.group(1).lower()
+                if created_tname.startswith(target_table.lower()) or target_table.lower() in created_tname:
+                    body = m.group(2)
+                    for col_def in body.split(","):
+                        col_def = col_def.strip()
+                        if re.search(r"\bNOT\s+NULL\b", col_def, re.IGNORECASE):
+                            col_words = re.findall(r"\b[a-zA-Z0-9_]+\b", col_def)
+                            if col_words and col_words[0].upper() not in ("PRIMARY", "UNIQUE", "CHECK", "FOREIGN", "CONSTRAINT"):
+                                declared_not_null_cols.add(col_words[0])
+
+        if not null_columns:
+            return ""
+
+        first_match = re.search(r"NOT NULL constraint failed:\s*([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)", err_msg)
+        first_col = first_match.group(2) if first_match else "column"
+
+        vuln_lines = []
+        vuln_names = []
+        for cname, cnt in sorted(null_columns.items()):
+            vuln_names.append(cname)
+            is_base_null = baseline_nullable.get(cname, True)
+            base_status = "nullable in original schema" if is_base_null else "non-null in original schema"
+            mapping = next((m for m in spec.get_table_mappings(target_table) if m.new_column == cname), None) if spec else None
+            spec_default = f", spec default: '{mapping.default_value}'" if mapping and mapping.default_value is not None else ""
+            vuln_lines.append(f"  - '{cname}': {cnt} NULL row(s) in source table ({base_status}{spec_default})")
+
+        names_str = ", ".join(f"'{n}'" for n in vuln_names)
+
+        diag = (
+            f" [MULTI-COLUMN NOT NULL DIAGNOSTIC: SQLite halted at the first NOT NULL violation ('{first_col}'), "
+            f"but multiple columns contain NULL values in the source table:\n"
+            + "\n".join(vuln_lines)
+            + f"\nCRITICAL FIX INSTRUCTIONS FOR THIS SINGLE PASS:\n"
+            f"1. In your CREATE TABLE statement, do NOT add NOT NULL to existing columns ({names_str}) "
+            f"that were nullable in the original schema unless explicitly required by the migration goal. Keep them nullable.\n"
+            f"2. For EVERY column in the new table that IS declared NOT NULL, wrap its SELECT expression with "
+            f"COALESCE(<col>, <safe_default>) in this single repair pass so another column does not fail sequentially.]"
+        )
+        return diag
+    except Exception as exc:
+        logger.debug(f"Error computing multi-column NULL diagnostics: {exc}")
+        return ""
+

@@ -29,7 +29,11 @@ from timemachine.traps.profiler import (
     profile_database,
     set_cached_profile,
 )
-from timemachine.verify.invariants import InvariantResult, evaluate_migration_invariants
+from timemachine.verify.invariants import (
+    InvariantResult,
+    audit_null_crash_diagnostics,
+    evaluate_migration_invariants,
+)
 from timemachine.verify.rebuild import estimate_production_lock_time, verify_rollback_roundtrip
 from timemachine.verify.spec import MigrationSpec
 
@@ -419,6 +423,26 @@ def parse_sql_scripts(content: str) -> tuple[str, str]:
     return up, down
 
 
+def get_model_timeout(model: str, settings: Any) -> float:
+    """Return model-specific request timeout in seconds."""
+    m_lower = model.lower()
+    if "ultra" in m_lower:
+        val = getattr(settings, "ultra_llm_timeout_s", None)
+        if isinstance(val, (int, float)):
+            return max(75.0, float(val))
+        return 75.0
+    elif "super" in m_lower:
+        val = getattr(settings, "fast_llm_timeout_s", None)
+        if isinstance(val, (int, float)):
+            return max(45.0, float(val))
+        return 45.0
+
+    val = getattr(settings, "llm_timeout_s", None)
+    if isinstance(val, (int, float)):
+        return max(45.0, float(val))
+    return 75.0
+
+
 def run_time_machine_agent(
     adapter: DbAdapter,
     goal: str,
@@ -428,6 +452,7 @@ def run_time_machine_agent(
     max_steps: int | None = None,
     is_naive_baseline: bool = False,
     progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
+    wall_clock_timeout_s: float | None = None,
 ) -> AgentRunResult:
     """Run autonomous dry-run migration agent loop.
 
@@ -543,7 +568,7 @@ def run_time_machine_agent(
 
     # Phase 2: Agent Tool/Draft Loop
     settings = get_settings(reload=True)
-    wall_clock_budget = settings.agent_wall_clock_timeout_s
+    wall_clock_budget = wall_clock_timeout_s if wall_clock_timeout_s is not None else settings.agent_wall_clock_timeout_s
     max_tool_rounds = settings.max_tool_rounds_per_step
 
     current_model = fast_model
@@ -554,7 +579,6 @@ def run_time_machine_agent(
     step_num = 0
     attempt_num = 1
     max_attempts = max_steps if max_steps is not None else getattr(settings, "max_attempts", 6)
-    step_cap_s = wall_clock_budget / max(max_attempts, 1)
     attempts: list[AttemptRecord] = []
     consecutive_no_sql = 0
     last_tool_sql = ""
@@ -677,14 +701,14 @@ def run_time_machine_agent(
 
         for _ in range(max_tool_rounds):
             remaining_total = wall_clock_budget - (time.time() - start_time)
-            remaining_step = step_cap_s - (time.time() - step_start_time)
-            if remaining_total < 10.0 or remaining_step < 5.0:
+            if remaining_total < 5.0:
                 logger.warning(
-                    f"Step ({remaining_step:.1f}s) or total budget ({remaining_total:.1f}s) nearly exhausted. "
+                    f"Total budget ({remaining_total:.1f}s) nearly exhausted. "
                     "Stopping tool loop to finalize migration."
                 )
                 break
-            call_timeout = min(remaining_total, remaining_step, settings.llm_timeout_s)
+            model_timeout = get_model_timeout(current_model, settings)
+            call_timeout = min(remaining_total, model_timeout)
             t_call_start = time.time()
 
             tools_to_pass = TOOL_DEFINITIONS if consecutive_no_sql == 0 else None
@@ -698,35 +722,71 @@ def run_time_machine_agent(
                     timeout=call_timeout,
                 )
             except AgentError as ae:
-                logger.error(f"Agent LLM call failed: {ae}")
-                steps.append(
-                    AgentStepLog(
-                        step=len(steps) + 1,
-                        model=current_model,
-                        action="call_llm_error",
-                        details={"error": str(ae)},
-                        latency_ms=(time.time() - t_call_start) * 1000,
-                        status="error",
+                ae_msg = str(ae)
+                is_timeout_or_transient = any(
+                    k in ae_msg.lower()
+                    for k in ("timed out", "timeout", "high load", "rate limit", "temporarily", "connection")
+                )
+                can_fallback_to_super = (
+                    current_model == ultra_model
+                    and ultra_model != fast_model
+                    and is_timeout_or_transient
+                    and attempt_num <= max_attempts
+                    and (wall_clock_budget - (time.time() - start_time)) > 5.0
+                )
+
+                raw_msg = None
+                if can_fallback_to_super:
+                    fallback_msg = "Ultra model timed out; falling back to Super model for repair..."
+                    logger.warning(fallback_msg)
+                    notify(fallback_msg, {"step": step_num, "attempt": attempt_num, "error": ae_msg})
+                    current_model = fast_model
+                    super_timeout = get_model_timeout(current_model, settings)
+                    rem_tot = wall_clock_budget - (time.time() - start_time)
+                    retry_call_timeout = min(rem_tot, super_timeout)
+                    try:
+                        raw_msg, usage = call_llm(
+                            client,
+                            current_model,
+                            messages=truncate_older_tool_results(messages),
+                            temperature=0.2,
+                            tools=tools_to_pass,
+                            timeout=retry_call_timeout,
+                        )
+                    except AgentError as fallback_ae:
+                        logger.error(f"Fallback to Super model failed: {fallback_ae}")
+                        ae = fallback_ae
+
+                if raw_msg is None:
+                    logger.error(f"Agent LLM call failed: {ae}")
+                    steps.append(
+                        AgentStepLog(
+                            step=len(steps) + 1,
+                            model=current_model,
+                            action="call_llm_error",
+                            details={"error": str(ae)},
+                            latency_ms=(time.time() - t_call_start) * 1000,
+                            status="error",
+                        )
                     )
-                )
-                final_up = best_up_sql or current_up_sql or (last_tool_sql if has_ddl_or_dml(last_tool_sql) else "")
-                final_down = best_down_sql or current_down_sql or (last_tool_down_sql if last_tool_down_sql else "")
-                return AgentRunResult(
-                    status="FAILED",
-                    up_sql=final_up,
-                    down_sql=final_down,
-                    spec=spec,
-                    steps=steps,
-                    attempts=attempts,
-                    invariant_result=best_inv_result or inv_result,
-                    total_tokens=total_tokens,
-                    total_latency_ms=(time.time() - start_time) * 1000,
-                    stop_reason=f"AGENT_ERROR: {ae}",
-                    notes=f"Agent LLM error: {ae}",
-                    fast_model=fast_model,
-                    ultra_model=ultra_model,
-                    model_warnings=warnings,
-                )
+                    final_up = best_up_sql or current_up_sql or (last_tool_sql if has_ddl_or_dml(last_tool_sql) else "")
+                    final_down = best_down_sql or current_down_sql or (last_tool_down_sql if last_tool_down_sql else "")
+                    return AgentRunResult(
+                        status="FAILED",
+                        up_sql=final_up,
+                        down_sql=final_down,
+                        spec=spec,
+                        steps=steps,
+                        attempts=attempts,
+                        invariant_result=best_inv_result or inv_result,
+                        total_tokens=total_tokens,
+                        total_latency_ms=(time.time() - start_time) * 1000,
+                        stop_reason=f"AGENT_ERROR: {ae}",
+                        notes=f"Agent LLM error: {ae}",
+                        fast_model=fast_model,
+                        ultra_model=ultra_model,
+                        model_warnings=warnings,
+                    )
 
             call_lat = (time.time() - t_call_start) * 1000
             last_step_lat = call_lat
@@ -828,8 +888,8 @@ def run_time_machine_agent(
 
         # Final nudge call: if tool rounds budget reached and no SQL produced yet
         remaining_total = wall_clock_budget - (time.time() - start_time)
-        remaining_step = step_cap_s - (time.time() - step_start_time)
-        call_timeout = min(remaining_total, remaining_step, settings.llm_timeout_s)
+        model_timeout = get_model_timeout(current_model, settings)
+        call_timeout = min(remaining_total, model_timeout)
         if not step_up_sql and remaining_total >= 10.0 and messages and messages[-1].get("role") == "tool":
             t_nudge_start = time.time()
             final_reminder = {
@@ -1029,11 +1089,15 @@ def run_time_machine_agent(
                         hint = f" [How to fix: Column '{col_name}' has {null_cnt} NULL rows in source table. Use COALESCE({col_name}, '{mapping.default_value}') to fill defaults as specified in spec.]"
                     else:
                         hint = f" [How to fix: Column '{col_name}' has {null_cnt} NULL rows in source table. Keep '{col_name}' nullable in the table definition or provide a safe default.]"
+                multi_diag = audit_null_crash_diagnostics(
+                    base_clone, target_table, err_msg, current_sql=current_up_sql, spec=spec
+                )
+                full_err = f"{err_msg}{multi_diag or hint}"
                 inv_result = InvariantResult(
                     status="FAILED",
                     passed=False,
-                    error=f"{err_msg}{hint}",
-                    failed_checks=[f"{err_msg}{hint}"],
+                    error=full_err,
+                    failed_checks=[full_err],
                     elapsed_ms=run_elapsed,
                     before_count=real_before,
                 )
@@ -1241,7 +1305,7 @@ Sample diffs: {diffs_text}
 Task: Provide ONLY the corrected DOWN migration inside a ```sql block to restore table '{target_table}' to its original baseline state."""
 
                 try:
-                    call_to = min(settings.llm_timeout_s, 30.0, max(2.0, remaining_budget))
+                    call_to = min(remaining_budget, get_model_timeout(ultra_model, settings))
                     raw_msg, _ = call_llm(
                         client,
                         ultra_model,

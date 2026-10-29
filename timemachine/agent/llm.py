@@ -206,8 +206,9 @@ def call_llm(
                 "Rate limit reached (HTTP 429). Please wait a few seconds and retry."
             ) from exc
         if "timeout" in name.lower() or "timeout" in msg.lower():
+            timeout_val = int(timeout) if timeout is not None else int(settings.llm_timeout_s)
             raise AgentError(
-                f"Nebius API request timed out ({int(settings.llm_timeout_s)}s). The model service may be experiencing high load."
+                f"Nebius API request timed out ({timeout_val}s). The model service may be experiencing high load."
             ) from exc
         if "connection" in name.lower() or "connect" in msg.lower():
             raise AgentError(

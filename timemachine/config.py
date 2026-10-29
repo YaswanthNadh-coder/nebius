@@ -155,12 +155,20 @@ class Settings(BaseModel):
         default=8192,
         description="Maximum completion tokens per LLM invocation",
     )
+    fast_llm_timeout_s: float = Field(
+        default=45.0,
+        description="HTTP client timeout for Nemotron Super (fast drafting) in seconds",
+    )
+    ultra_llm_timeout_s: float = Field(
+        default=75.0,
+        description="HTTP client timeout for Nemotron Ultra (deep reasoning) in seconds",
+    )
     llm_timeout_s: float = Field(
-        default=90.0,
-        description="HTTP client timeout for LLM requests",
+        default=75.0,
+        description="HTTP client timeout for LLM requests in seconds",
     )
     agent_wall_clock_timeout_s: float = Field(
-        default=300.0,
+        default=240.0,
         description="Maximum total wall-clock budget in seconds for an agent execution run",
     )
     max_tool_rounds_per_step: int = Field(

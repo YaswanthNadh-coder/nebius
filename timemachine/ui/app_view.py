@@ -223,7 +223,7 @@ def render_sidebar():
             "Wall Clock Budget (s)",
             min_value=30,
             max_value=1200,
-            value=int(st.session_state.get("agent_wall_clock_timeout_s", 300)),
+            value=int(st.session_state.get("agent_wall_clock_timeout_s", 240)),
             step=30,
             help="Total wall-clock timeout budget for agent execution.",
         )
@@ -546,6 +546,7 @@ def render_run_tab():
                 max_steps=int(st.session_state.get("max_attempts", 6)),
                 is_naive_baseline=st.session_state.get("is_naive_baseline", False),
                 progress_callback=on_progress,
+                wall_clock_timeout_s=float(st.session_state.get("agent_wall_clock_timeout_s", 240.0)),
             )
 
             st.session_state["run_result"] = result

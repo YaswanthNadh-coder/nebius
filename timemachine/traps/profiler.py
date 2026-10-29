@@ -27,6 +27,7 @@ class ColumnProfile(BaseModel):
     has_whitespace_padding: bool = False
     has_case_variants: bool = False
     orphan_fk_count: int = 0
+    is_nullable: bool = True
     masked_sample: list[str] = Field(default_factory=list)
 
 
@@ -169,6 +170,7 @@ def profile_table(conn: sqlite3.Connection, table_schema: TableSchema | str, lim
             has_whitespace_padding=has_whitespace,
             has_case_variants=False,
             orphan_fk_count=orphan_cnt,
+            is_nullable=not col.notnull,
             masked_sample=masked,
         )
 
