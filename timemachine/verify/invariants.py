@@ -149,7 +149,15 @@ def evaluate_migration_invariants(
 
     # ── Check 3: PRAGMA table_info, Columns and Primary Key ───────────────
     m_cur.execute(f"PRAGMA table_info({q_target})")
-    col_meta = {r[1]: {"type": r[2], "notnull": bool(r[3]), "default": r[4], "pk": r[5]} for r in m_cur.fetchall()}
+    col_meta = {
+        r[1]: {
+            "type": r[2],
+            "notnull": bool(r[3]) or (r[5] > 0),
+            "default": r[4],
+            "pk": r[5],
+        }
+        for r in m_cur.fetchall()
+    }
     actual_col_names = list(col_meta.keys())
 
     # Resolve expected and non-null cols
@@ -179,7 +187,13 @@ def evaluate_migration_invariants(
     for col in target_nn_cols:
         # In SQLite, INTEGER PRIMARY KEY columns are naturally non-null (rowid aliases)
         # even though PRAGMA table_info reports notnull=0.
-        if col in col_meta and not col_meta[col]["notnull"] and not col_meta[col]["pk"]:
+        is_nn_satisfied = False
+        if col in col_meta:
+            meta = col_meta[col]
+            if meta["notnull"] or meta["pk"] > 0:
+                is_nn_satisfied = True
+
+        if not is_nn_satisfied:
             failed_checks.append(
                 f"SCHEMA_CONSTRAINT_VIOLATION: Column '{col}' is not defined as NOT NULL. [How to fix: specify '{col}' NOT NULL in CREATE TABLE]"
             )
@@ -495,20 +509,113 @@ def evaluate_migration_invariants(
     )
 
 
-def audit_null_crash_diagnostics(
+def audit_crash_diagnostics(
     base_conn: sqlite3.Connection,
     target_table: str,
     err_msg: str,
     current_sql: str = "",
     spec: MigrationSpec | None = None,
 ) -> str:
-    """Audit all columns in target_table containing NULLs when a NOT NULL constraint crashes.
+    """Audit vulnerable columns when execution crashes on NOT NULL or FOREIGN KEY constraints.
 
-    Identifies all vulnerable columns in the source table that contain NULLs (including synthetic traps),
-    checks which columns in the migration SQL are declared NOT NULL, and returns an explicit
-    multi-column diagnostic instruction to fix all vulnerable columns in a single repair turn.
+    Identifies all vulnerable columns in the source table that contain NULLs or orphan foreign keys,
+    checks declarations in migration SQL, and returns explicit remediation recipes so the LLM
+    can fix all related issues in a single repair turn.
     """
-    if "not null constraint failed" not in err_msg.lower():
+    err_lower = err_msg.lower()
+
+    # ── Branch 1: Foreign Key Constraint Failure ───────────────────────────
+    if "foreign key constraint failed" in err_lower:
+        try:
+            cur = base_conn.cursor()
+            fk_matches: list[tuple[str, str, str]] = []
+            if current_sql:
+                # Column-level REFERENCES
+                for m in re.finditer(
+                    r"([a-zA-Z0-9_]+)\s+[^,\(\)]*?\bREFERENCES\s+[\"']?([a-zA-Z0-9_]+)[\"']?\s*\(\s*[\"']?([a-zA-Z0-9_]+)[\"']?\s*\)",
+                    current_sql,
+                    re.IGNORECASE,
+                ):
+                    fk_matches.append((m.group(1), m.group(2), m.group(3)))
+                # Table-level FOREIGN KEY (col) REFERENCES parent(pk)
+                for m in re.finditer(
+                    r"FOREIGN\s+KEY\s*\(\s*[\"']?([a-zA-Z0-9_]+)[\"']?\s*\)\s*REFERENCES\s+[\"']?([a-zA-Z0-9_]+)[\"']?\s*\(\s*[\"']?([a-zA-Z0-9_]+)[\"']?\s*\)",
+                    current_sql,
+                    re.IGNORECASE,
+                ):
+                    fk_matches.append((m.group(1), m.group(2), m.group(3)))
+
+            # If no matches in SQL, check baseline foreign_key_list
+            if not fk_matches:
+                try:
+                    cur.execute(f'PRAGMA foreign_key_list("{target_table}")')
+                    for r in cur.fetchall():
+                        fk_matches.append((r[3], r[2], r[4]))
+                except Exception:
+                    pass
+
+            # If still none, check schema for candidate parent tables
+            if not fk_matches:
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+                all_tbls = [r[0] for r in cur.fetchall() if r[0].lower() != target_table.lower()]
+                for pt in all_tbls:
+                    cur.execute(f'PRAGMA table_info("{pt}")')
+                    p_pks = [r[1] for r in cur.fetchall() if r[5] > 0]
+                    if p_pks:
+                        cur.execute(f'PRAGMA table_info("{target_table}")')
+                        t_cols = [r[1] for r in cur.fetchall()]
+                        for tc in t_cols:
+                            if any(part in tc.lower() for part in (pt.lower(), p_pks[0].lower(), "dept")):
+                                fk_matches.append((tc, pt, p_pks[0]))
+
+            fk_diagnostics: list[str] = []
+            for child_col, parent_table, parent_pk in fk_matches:
+                # Ensure parent table exists
+                cur.execute("SELECT count(*) FROM sqlite_master WHERE type='table' AND lower(name)=lower(?)", (parent_table,))
+                if cur.fetchone()[0] == 0:
+                    continue
+
+                cur.execute(f'SELECT DISTINCT "{parent_pk}" FROM "{parent_table}" LIMIT 10')
+                valid_parent_keys = [str(r[0]) for r in cur.fetchall()]
+
+                cur.execute(
+                    f'SELECT DISTINCT "{child_col}" FROM "{target_table}" '
+                    f'WHERE "{child_col}" IS NOT NULL AND "{child_col}" NOT IN (SELECT "{parent_pk}" FROM "{parent_table}")'
+                )
+                orphan_values = [str(r[0]) for r in cur.fetchall()]
+
+                cur.execute(f'SELECT COUNT(*) FROM "{target_table}" WHERE "{child_col}" IS NULL')
+                null_cnt = cur.fetchone()[0]
+
+                first_valid = repr(valid_parent_keys[0]) if valid_parent_keys else "'DEFAULT'"
+                orphans_str = ", ".join(repr(v) for v in orphan_values) if orphan_values else "None detected"
+                valid_str = ", ".join(repr(k) for k in valid_parent_keys)
+
+                fk_diagnostics.append(
+                    f"Foreign key '{target_table}.{child_col}' -> '{parent_table}({parent_pk})':\n"
+                    f"  - Valid parent keys in '{parent_table}': [{valid_str}]\n"
+                    f"  - Orphan values in '{target_table}.{child_col}' not in '{parent_table}': [{orphans_str}]\n"
+                    f"  - NULL rows in '{target_table}.{child_col}': {null_cnt}\n"
+                    f"  CONCRETE REMEDIATION RECIPE:\n"
+                    f"  In your INSERT INTO ... SELECT query, sanitize '{child_col}' using:\n"
+                    f"    CASE\n"
+                    f"      WHEN \"{child_col}\" IN (SELECT \"{parent_pk}\" FROM \"{parent_table}\") THEN \"{child_col}\"\n"
+                    f"      ELSE NULL  -- Map orphan codes and unmapped values to NULL (or {first_valid} if declared NOT NULL)\n"
+                    f"    END AS \"{child_col}\""
+                )
+
+            if fk_diagnostics:
+                return (
+                    " [FOREIGN KEY CONSTRAINT CRASH DIAGNOSTIC: SQLite failed with FOREIGN KEY constraint failed.\n"
+                    + "\n\n".join(fk_diagnostics)
+                    + "\nMap all orphan foreign keys to NULL (or a valid parent key) in your SELECT statement before inserting.]"
+                )
+        except Exception as exc:
+            logger.debug(f"Error computing foreign key crash diagnostics: {exc}")
+            return ""
+
+    # ── Branch 2: NOT NULL Constraint Failure ──────────────────────────────
+    if "not null constraint failed" not in err_lower:
         return ""
 
     try:
@@ -559,13 +666,15 @@ def audit_null_crash_diagnostics(
 
         vuln_lines = []
         vuln_names = []
+        unchanged_cols = set(spec.columns_declared_unchanged.get(target_table, [])) if spec else set()
         for cname, cnt in sorted(null_columns.items()):
             vuln_names.append(cname)
             is_base_null = baseline_nullable.get(cname, True)
             base_status = "nullable in original schema" if is_base_null else "non-null in original schema"
             mapping = next((m for m in spec.get_table_mappings(target_table) if m.new_column == cname), None) if spec else None
             spec_default = f", spec default: '{mapping.default_value}'" if mapping and mapping.default_value is not None else ""
-            vuln_lines.append(f"  - '{cname}': {cnt} NULL row(s) in source table ({base_status}{spec_default})")
+            unchanged_tag = " (⚠️ UNCHANGED COLUMN: Must remain NULLABLE in CREATE TABLE to preserve original NULLs; do NOT coalesce!)" if cname in unchanged_cols else ""
+            vuln_lines.append(f"  - '{cname}': {cnt} NULL row(s) in source table ({base_status}{spec_default}){unchanged_tag}")
 
         names_str = ", ".join(f"'{n}'" for n in vuln_names)
 
@@ -583,4 +692,9 @@ def audit_null_crash_diagnostics(
     except Exception as exc:
         logger.debug(f"Error computing multi-column NULL diagnostics: {exc}")
         return ""
+
+
+# Backwards compatibility alias
+audit_null_crash_diagnostics = audit_crash_diagnostics
+
 

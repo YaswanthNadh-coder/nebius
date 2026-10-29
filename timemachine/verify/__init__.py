@@ -2,6 +2,8 @@
 
 from timemachine.verify.invariants import (
     InvariantResult,
+    audit_crash_diagnostics,
+    audit_null_crash_diagnostics,
     evaluate_migration_invariants,
 )
 from timemachine.verify.oracle import (
@@ -46,6 +48,8 @@ __all__ = [
     "trim_case",
     "verify_rows_with_oracle",
     "InvariantResult",
+    "audit_crash_diagnostics",
+    "audit_null_crash_diagnostics",
     "evaluate_migration_invariants",
     "verify_rollback_roundtrip",
     "estimate_production_lock_time",

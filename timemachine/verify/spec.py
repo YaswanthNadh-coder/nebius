@@ -63,4 +63,12 @@ class MigrationSpec(BaseModel):
     def get_non_null_columns(self, table: str) -> list[str]:
         """List of columns that must be NOT NULL according to the spec."""
         mappings = self.get_table_mappings(table)
-        return [m.new_column for m in mappings if m.null_policy == "not_null"]
+        unchanged = {c.lower() for c in self.columns_declared_unchanged.get(table, [])}
+        res = []
+        for m in mappings:
+            if m.null_policy == "not_null":
+                # An untouched passthrough column cannot be forced NOT NULL
+                if m.new_column.lower() in unchanged and (m.transform or "passthrough").lower() in ("passthrough", "identity"):
+                    continue
+                res.append(m.new_column)
+        return res

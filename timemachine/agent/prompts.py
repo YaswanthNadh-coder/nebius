@@ -282,6 +282,7 @@ def build_repair_prompt(
     history: Any = None,
     split_rule: str = "",
     down_sql: str = "",
+    target_table: str = "employees",
 ) -> str:
     """Build repair prompt with structured failure telemetry, multi-attempt memory, and dynamic checklist."""
     schema_text = format_schema_summary(schema)
@@ -327,6 +328,25 @@ Output the complete, corrected SQLite migration inside a ```sql ``` block with b
     checklist_text = "\n".join([f"{i + 1}. {item}" for i, item in enumerate(checklist_items)])
     contract_section = f"\n{contract_text}\n" if contract_text else ""
 
+    high_priority_guidance = ""
+    if result and len(result.passed_checks) > 10:
+        schema_only = all(
+            ("SCHEMA_CONSTRAINT_VIOLATION" in fc or "UNTOUCHED_COLUMN_MUTATED" in fc or "INDEX" in fc or "PRIMARY" in fc)
+            for fc in result.failed_checks
+        )
+        if schema_only:
+            unchanged_cols = spec.columns_declared_unchanged.get(target_table, []) if spec else []
+            unchanged_str = ", ".join(f"'{c}'" for c in unchanged_cols) if unchanged_cols else "untouched columns"
+            high_priority_guidance = (
+                f"\n💡 HIGH PRIORITY REPAIR GUIDANCE:\n"
+                f"Your SELECT transformation logic is ALREADY WORKING and passed {len(result.passed_checks)} invariant checks!\n"
+                f"1. DO NOT CHANGE your SELECT expressions for untouched columns ({unchanged_str})! Do NOT add COALESCE or dummy defaults to unchanged columns.\n"
+                f"2. In your CREATE TABLE statement, ensure column definitions match:\n"
+                f"   - For PRIMARY KEY columns: specify 'id INTEGER PRIMARY KEY' (or 'id INTEGER PRIMARY KEY NOT NULL').\n"
+                f"   - For preserved/untouched columns ({unchanged_str}): define them as NULLABLE if they were nullable originally.\n"
+                f"   - For transformed columns required to be non-null (e.g. first_name, last_name): keep them NOT NULL.\n"
+            )
+
     return f"""The previous SQLite schema migration failed dry-run verification on the sandbox clone.
 {history_block}
 {reintroduced_warnings}
@@ -341,6 +361,7 @@ Row Counts: Before={result.before_count}, After={result.after_count}
 Failed Checks:
 {failed_checks_text}
 {traps_text}
+{high_priority_guidance}
 {contract_section}
 {gotchas_text}
 Task:

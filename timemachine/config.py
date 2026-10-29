@@ -144,7 +144,7 @@ class Settings(BaseModel):
         description="Maximum source database file size allowed into RAM clone",
     )
     max_agent_steps: int = Field(
-        default=8,
+        default=15,
         description="Maximum agent tool-calling steps budget",
     )
     max_attempts: int = Field(

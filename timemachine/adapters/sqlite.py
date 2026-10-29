@@ -200,11 +200,12 @@ class SQLiteAdapter(DbAdapter):
             cols: list[ColumnInfo] = []
             for r in cur.fetchall():
                 # (cid, name, type, notnull, dflt_value, pk)
+                is_pk = bool(r[5])
                 cols.append(
                     ColumnInfo(
                         name=r[1],
                         type=r[2] or "TEXT",
-                        notnull=bool(r[3]),
+                        notnull=bool(r[3]) or is_pk,
                         default=str(r[4]) if r[4] is not None else None,
                         pk=r[5],
                     )

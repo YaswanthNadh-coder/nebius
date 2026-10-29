@@ -169,7 +169,7 @@ def auto_fix_spec_null_policies(spec: MigrationSpec, schema: DatabaseSchema) -> 
             src_col = col_by_name.get(src_col_name)
 
             # Never require NOT NULL for an INTEGER PRIMARY KEY
-            if src_col and src_col.pk > 0 and "INT" in src_col.type.upper():
+            if (src_col and src_col.pk > 0 and "INT" in src_col.type.upper()) or (m.new_column.lower() == "id" and src_col and src_col.pk > 0):
                 if m.null_policy == "not_null":
                     logger.info(
                         f"Auto-fixing null_policy for INTEGER PRIMARY KEY column '{tbl_name}.{m.new_column}' to 'nullable'."
@@ -178,10 +178,10 @@ def auto_fix_spec_null_policies(spec: MigrationSpec, schema: DatabaseSchema) -> 
                 continue
 
             # Check if passthrough or declared unchanged
+            is_unchanged = m.new_column.lower() in unchanged_cols or src_col_name in unchanged_cols
             is_passthrough = (
-                m.transform in ("passthrough", "custom")
-                or m.new_column.lower() in unchanged_cols
-                or src_col_name in unchanged_cols
+                m.transform in ("passthrough", "custom", "identity", None)
+                or is_unchanged
             )
 
             # Check if transform supplies a default
@@ -191,8 +191,8 @@ def auto_fix_spec_null_policies(spec: MigrationSpec, schema: DatabaseSchema) -> 
             )
 
             if is_passthrough and src_col is not None:
-                # If source column is nullable
-                if not src_col.notnull and not has_default and m.null_policy == "not_null":
+                # If source column is nullable or if declared unchanged
+                if (not src_col.notnull or is_unchanged) and not has_default and m.null_policy == "not_null":
                     logger.info(
                         f"Auto-fixing null_policy for nullable passthrough column '{tbl_name}.{m.new_column}' to 'nullable'."
                     )

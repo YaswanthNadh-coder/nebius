@@ -12,7 +12,11 @@ from pydantic import BaseModel, Field
 
 from timemachine.adapters.base import DbAdapter
 from timemachine.agent.llm import call_llm, clean_sql, get_client, resolve_nebius_models
-from timemachine.agent.planner import generate_spec, validate_spec_against_schema
+from timemachine.agent.planner import (
+    auto_fix_spec_null_policies,
+    generate_spec,
+    validate_spec_against_schema,
+)
 from timemachine.agent.prompts import (
     build_migration_prompt,
     build_repair_prompt,
@@ -31,7 +35,7 @@ from timemachine.traps.profiler import (
 )
 from timemachine.verify.invariants import (
     InvariantResult,
-    audit_null_crash_diagnostics,
+    audit_crash_diagnostics,
     evaluate_migration_invariants,
 )
 from timemachine.verify.rebuild import estimate_production_lock_time, verify_rollback_roundtrip
@@ -287,6 +291,15 @@ def _clean_sql_section(section: str) -> str:
     return res if res else cleaned
 
 
+def strip_thinking(text: str | None) -> str:
+    """Strip <think>...</think> reasoning blocks from text to keep conversation history concise."""
+    if not text:
+        return ""
+    cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"<think>.*", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    return cleaned.strip()
+
+
 def truncate_older_tool_results(
     messages: list[dict[str, Any]],
     keep_full_count: int = 2,
@@ -484,6 +497,10 @@ def run_time_machine_agent(
 
     # Phase 1: Planning (derive spec if not provided, or validate supplied spec)
     if spec is not None:
+        try:
+            auto_fix_spec_null_policies(spec, schema)
+        except Exception as af_err:
+            logger.debug(f"Auto-fix null policies notice: {af_err}")
         val_errors = validate_spec_against_schema(spec, schema, target_table)
         if val_errors:
             logger.error(f"Supplied MigrationSpec failed schema validation: {val_errors}")
@@ -611,6 +628,7 @@ def run_time_machine_agent(
     best_inv_result: InvariantResult | None = None
     best_failed_count: int = 999999
     best_passed_count: int = -1
+    best_is_non_crash: bool = False
 
     while attempt_num <= max_attempts:
         step_num += 1
@@ -649,6 +667,7 @@ def run_time_machine_agent(
                 history=attempt_history,
                 split_rule=step_split_rule,
                 down_sql=current_down_sql,
+                target_table=target_table,
             )
             prompt = f"Your previous reply was {repeat_feedback}.\n\n{base_p}"
             repeat_feedback = None
@@ -689,6 +708,7 @@ def run_time_machine_agent(
                 history=attempt_history,
                 split_rule=step_split_rule,
                 down_sql=current_down_sql,
+                target_table=target_table,
             )
             messages.append({"role": "user", "content": prompt})
 
@@ -823,7 +843,7 @@ def run_time_machine_agent(
 
                 assistant_turn: dict[str, Any] = {"role": "assistant"}
                 if content:
-                    assistant_turn["content"] = content
+                    assistant_turn["content"] = strip_thinking(content)
                 assistant_turn["tool_calls"] = tc_dicts
                 messages.append(assistant_turn)
 
@@ -883,7 +903,7 @@ def run_time_machine_agent(
                 if step_up_sql:
                     break
             else:
-                messages.append({"role": "assistant", "content": content})
+                messages.append({"role": "assistant", "content": strip_thinking(content)})
                 break
 
         # Final nudge call: if tool rounds budget reached and no SQL produced yet
@@ -911,7 +931,7 @@ def run_time_machine_agent(
                 total_tokens += nudge_tokens
 
                 content = raw_msg.content or ""
-                messages.append({"role": "assistant", "content": content})
+                messages.append({"role": "assistant", "content": strip_thinking(content)})
                 if content:
                     extracted_up, extracted_down, split_rule = parse_sql_scripts_ex(content)
                     if extracted_up:
@@ -1089,7 +1109,7 @@ def run_time_machine_agent(
                         hint = f" [How to fix: Column '{col_name}' has {null_cnt} NULL rows in source table. Use COALESCE({col_name}, '{mapping.default_value}') to fill defaults as specified in spec.]"
                     else:
                         hint = f" [How to fix: Column '{col_name}' has {null_cnt} NULL rows in source table. Keep '{col_name}' nullable in the table definition or provide a safe default.]"
-                multi_diag = audit_null_crash_diagnostics(
+                multi_diag = audit_crash_diagnostics(
                     base_clone, target_table, err_msg, current_sql=current_up_sql, spec=spec
                 )
                 full_err = f"{err_msg}{multi_diag or hint}"
@@ -1207,15 +1227,30 @@ def run_time_machine_agent(
             )
         )
 
+        cleaned_content = strip_thinking(content)
         if not any(m.get("role") == "assistant" and (m.get("content") or m.get("tool_calls")) for m in messages[-2:]):
-            messages.append({"role": "assistant", "content": content or f"```sql\n{current_up_sql}\n```"})
+            messages.append({"role": "assistant", "content": cleaned_content or f"```sql\n{current_up_sql}\n```"})
 
-        # Best-attempt tracking: fewest failed checks (ties: most passed checks)
+        # Best-attempt tracking:
+        # Non-crashes (run_ok is True and passed_count > 0) strictly outrank crashes (run_ok is False)
+        # Ties are broken by fewest failed checks, then most passed checks.
         failed_count = len(inv_result.failed_checks)
         passed_count = len(inv_result.passed_checks)
-        if failed_count < best_failed_count or (failed_count == best_failed_count and passed_count > best_passed_count):
+        is_non_crash = (run_ok is True and passed_count > 0)
+
+        is_better = False
+        if is_non_crash and not best_is_non_crash:
+            is_better = True
+        elif is_non_crash == best_is_non_crash:
+            if failed_count < best_failed_count:
+                is_better = True
+            elif failed_count == best_failed_count and passed_count > best_passed_count:
+                is_better = True
+
+        if is_better:
             best_failed_count = failed_count
             best_passed_count = passed_count
+            best_is_non_crash = is_non_crash
             best_up_sql = current_up_sql
             best_down_sql = current_down_sql
             best_inv_result = inv_result
@@ -1254,6 +1289,8 @@ def run_time_machine_agent(
         final_down = best_down_sql or current_down_sql
         if best_inv_result is not None:
             inv_result = best_inv_result
+            if inv_result.passed and inv_result.status in ("VERIFIED", "UNVERIFIED"):
+                is_forward_verified = True
 
     rollback_ok = False
     rollback_err: str | None = None
@@ -1301,6 +1338,11 @@ Classification: {rb_res.classification}
 Error: {rb_res.error}
 Missing/Lossy columns: {rb_res.lossy_columns}
 Sample diffs: {diffs_text}
+
+CRITICAL RULES FOR DOWN (ROLLBACK) MIGRATION:
+1. The DOWN migration must restore table '{target_table}' to its original baseline schema.
+2. NEVER add NOT NULL or new FOREIGN KEY constraints to columns that were nullable in the pre-migration baseline schema (such as salary, department, created_at).
+3. Do NOT mutate or alter untouched data values during rollback.
 
 Task: Provide ONLY the corrected DOWN migration inside a ```sql block to restore table '{target_table}' to its original baseline state."""
 
@@ -1368,7 +1410,7 @@ Task: Provide ONLY the corrected DOWN migration inside a ```sql block to restore
     stop_reason = (
         "SUCCESS: All verification invariants passed."
         if final_status in ("VERIFIED", "UNVERIFIED")
-        else f"MAX_ATTEMPTS_EXHAUSTED (attempts used {attempts}/{max_attempts})"
+        else f"MAX_ATTEMPTS_EXHAUSTED (attempts used {len(attempts)}/{max_attempts})"
     )
 
     total_lat = (time.time() - start_time) * 1000
