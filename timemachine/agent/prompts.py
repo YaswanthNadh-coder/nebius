@@ -1,5 +1,7 @@
 """Prompt templates for drafting and repairing schema migrations with transform contracts and gotchas."""
 
+from typing import Any
+
 from timemachine.adapters.schema import DatabaseSchema
 from timemachine.verify import oracle
 from timemachine.verify.invariants import InvariantResult
@@ -77,7 +79,8 @@ def generate_transform_contract(spec: MigrationSpec) -> str:
             doc = fn.__doc__.strip() if fn and fn.__doc__ else f"Apply {trans_name} transform."
             src_str = f" from {m.source_column}" if m.source_column else ""
             def_str = f" (default: {m.default_value!r})" if m.default_value is not None else ""
-            lines.append(f"- {m.new_column}{src_str} [transform: {trans_name}{def_str}]: {doc}")
+            orphan_str = f" [orphan_policy: {m.orphan_policy}]" if m.orphan_policy else ""
+            lines.append(f"- {m.new_column}{src_str} [transform: {trans_name}{def_str}]{orphan_str}: {doc}")
 
     return "\n".join(lines)
 
@@ -86,10 +89,10 @@ def get_sqlite_gotchas_block() -> str:
     """Generate concise SQLite gotchas block."""
     permitted = ", ".join(sorted(ALLOWED_PRAGMAS))
     return f"""SQLite Gotchas & Execution Rules:
-- In 12-step table rebuilds, always execute 'PRAGMA foreign_keys = OFF;' before 'BEGIN TRANSACTION;', and 'PRAGMA foreign_key_check;' before 'COMMIT;'.
+- In 12-step table rebuilds, map orphan keys according to orphan_policy before inserting; never disable enforcement to hide violations. Always execute 'PRAGMA foreign_key_check;' before 'COMMIT;'.
 - In 'CREATE TABLE target_new (...)', preserve the EXACT column nullability and defaults from the original schema for all untouched columns (e.g. if salary was nullable in the original schema, it MUST remain nullable; do NOT add NOT NULL to columns that were not originally NOT NULL).
 - In 'INSERT INTO target_new (...) SELECT ... FROM target', explicitly list ALL columns in both INSERT and SELECT clauses (including untouched columns like id, salary, created_at). Never omit untouched columns or SQLite will fail NOT NULL constraints.
-- If creating a FOREIGN KEY reference to a parent table (e.g. departments), ensure any orphan foreign keys (values present in child but missing from parent, like 'LEGACY_99') are inserted into the parent table first (e.g. 'INSERT OR IGNORE INTO parent_table (dept_code, dept_name) VALUES (...);') or mapped to NULL, otherwise PRAGMA foreign_key_check will fail with a foreign key constraint violation.
+- If creating a FOREIGN KEY reference to a parent table (e.g. departments), map orphan foreign keys according to orphan_policy before inserting (e.g. map orphan codes to NULL or insert parent lookup record first); never disable enforcement to hide violations.
 - Preserve the exact constraints (PRIMARY KEY, NOT NULL, DEFAULT) for all untouched columns from the original table schema.
 - TRIM(x) only removes standard spaces; to strip tabs, newlines, and carriage returns, use: TRIM(x, ' ' || char(9) || char(10) || char(13))
 - INSTR(string, substring) returns 0 when substring is not found (1-indexed).
@@ -141,7 +144,7 @@ def build_dynamic_task_checklist(result: InvariantResult | None) -> list[str]:
     # 6. Foreign Key Failures
     if "FOREIGN KEY" in failed_text or "FOREIGN_KEY" in failed_text:
         checklist.append(
-            "Fix foreign key failure: execute 'PRAGMA foreign_keys = OFF;' at the start of your script before 'BEGIN TRANSACTION;'. If adding foreign keys, ensure orphan records (keys not in parent table) are safely mapped or defaulted before 'PRAGMA foreign_key_check;'."
+            "Fix foreign key failure: map orphan keys according to orphan_policy before inserting; never disable enforcement to hide violations. Ensure orphan records (keys not in parent table) are safely mapped or defaulted before 'PRAGMA foreign_key_check;'."
         )
 
     # 7. Untouched Columns Mutation
@@ -183,12 +186,26 @@ def build_migration_prompt(
     spec: MigrationSpec,
     is_naive_baseline: bool = False,
     max_tool_calls: int = 6,
+    profiles: dict[str, Any] | None = None,
 ) -> str:
     """Build prompt for generating up.sql and down.sql."""
     schema_text = format_schema_summary(schema)
     spec_json = spec.model_dump_json(indent=2)
     contract_text = generate_transform_contract(spec)
     gotchas_text = get_sqlite_gotchas_block()
+
+    profile_section = ""
+    if profiles:
+        p_lines = []
+        for tbl_name, col_profiles in profiles.items():
+            for c_name, cp in col_profiles.items():
+                nc = getattr(cp, "null_count", 0) if not isinstance(cp, dict) else cp.get("null_count", 0)
+                tot = getattr(cp, "total_rows", 0) if not isinstance(cp, dict) else cp.get("total_rows", 0)
+                ms = getattr(cp, "masked_sample", []) if not isinstance(cp, dict) else cp.get("masked_sample", [])
+                sample_str = f" | Samples: {ms}" if ms else ""
+                p_lines.append(f"- {tbl_name}.{c_name}: {nc}/{tot} NULL rows{sample_str}")
+        if p_lines:
+            profile_section = "\nData Profile & Masked Sample Facts:\n" + "\n".join(p_lines) + "\n"
 
     if is_naive_baseline:
         instruction = (
@@ -217,10 +234,32 @@ Current Database Schema:
 
 Approved Migration Plan (MigrationSpec):
 {spec_json}
-{contract_section}
+{contract_section}{profile_section}
 {gotchas_text}
 {instruction}
 """
+
+
+def format_previous_attempts_block(history: Any) -> str:
+    """Format compact markdown table of previous attempts and cumulative requirements."""
+    if not history or not getattr(history, "records", None):
+        return ""
+
+    lines = ["\n### Previous attempts (memory):"]
+    lines.append("| Attempt | Model | Approach Summary | Failed Checks |")
+    lines.append("|---|---|---|---|")
+    for r in history.records:
+        fc_str = "; ".join(r.failed_check_types[:2]) if r.failed_check_types else "None"
+        appr_short = r.approach_summary[:60].replace("\n", " ") + ("..." if len(r.approach_summary) > 60 else "")
+        lines.append(f"| {r.attempt_num} | {r.model} | {appr_short} | {fc_str} |")
+
+    reqs = history.get_discovered_requirements() if hasattr(history, "get_discovered_requirements") else []
+    if reqs:
+        lines.append("\n### Requirements discovered so far (all must still hold):")
+        for i, req in enumerate(reqs, 1):
+            lines.append(f"{i}. {req}")
+
+    return "\n".join(lines) + "\n"
 
 
 def build_repair_prompt(
@@ -230,13 +269,26 @@ def build_repair_prompt(
     result: InvariantResult | None = None,
     trap_results: list[dict] | None = None,
     max_tool_calls: int = 6,
+    history: Any = None,
+    split_rule: str = "",
+    down_sql: str = "",
 ) -> str:
-    """Build repair prompt with structured failure telemetry, transform contract, and dynamic checklist."""
+    """Build repair prompt with structured failure telemetry, multi-attempt memory, and dynamic checklist."""
     schema_text = format_schema_summary(schema)
     contract_text = generate_transform_contract(spec)
     gotchas_text = get_sqlite_gotchas_block()
 
     tool_instruction = f"The schema is already above; do not call get_schema. You have at most {max_tool_calls} tool calls; finish with submit."
+
+    history_block = format_previous_attempts_block(history) if history else ""
+
+    reintroduced_warnings = ""
+    if history and result and hasattr(history, "check_reintroduced_failures"):
+        reintroduced = history.check_reintroduced_failures(result.failed_checks)
+        if reintroduced:
+            reintroduced_warnings = "\n" + "\n".join([f"⚠️ {w}" for w in reintroduced]) + "\n"
+
+    parsed_status = f"Parsed Script Status: UP parsed (rule: {split_rule or 'standard'}), DOWN parsed: {bool(down_sql)}\n"
 
     if result is None:
         truncated_reply = (failed_sql or "")[:500]
@@ -245,6 +297,7 @@ def build_repair_prompt(
 Target Schema:
 {schema_text}
 
+{history_block}
 your previous reply contained no executable SQL (reply was: {truncated_reply}); reply with the migration.
 {tool_instruction}
 
@@ -264,10 +317,9 @@ Output the complete, corrected SQLite migration inside a ```sql ``` block with b
     contract_section = f"\n{contract_text}\n" if contract_text else ""
 
     return f"""The previous SQLite schema migration failed dry-run verification on the sandbox clone.
-
-Target Schema:
-{schema_text}
-
+{history_block}
+{reintroduced_warnings}
+{parsed_status}
 Failed SQL Script:
 ```sql
 {failed_sql}

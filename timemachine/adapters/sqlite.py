@@ -23,6 +23,7 @@ from timemachine.verify.sandbox import (
     calc_sandbox_timeout,
     make_sandbox_authorizer,
     make_sandbox_progress_handler,
+    sandbox,
 )
 
 logger = get_logger("adapters.sqlite")
@@ -80,6 +81,11 @@ class SQLiteAdapter(DbAdapter):
     def from_sql_dump(cls, sql: str) -> "SQLiteAdapter":
         """Create adapter from SQL schema/data dump string."""
         return cls(sql_dump=sql)
+
+    @classmethod
+    def from_connection(cls, conn: sqlite3.Connection) -> "SQLiteAdapter":
+        """Create adapter from existing sqlite3 connection."""
+        return cls(source_conn=conn)
 
     @classmethod
     def create_in_memory(cls) -> "SQLiteAdapter":
@@ -352,16 +358,18 @@ class SQLiteAdapter(DbAdapter):
             pass
 
         scaled_timeout = calc_sandbox_timeout(total_rows, base_timeout_s=self.settings.sandbox_timeout_s)
-        authorizer = install_sandbox(clone_conn, timeout_s=scaled_timeout)
         cur = clone_conn.cursor()
         t0 = time.perf_counter()
+        authorizer = None
 
         try:
-            # Set FK state for test
-            cur.execute(f"PRAGMA foreign_keys = {'ON' if fk_enabled else 'OFF'}")
-            clone_conn.executescript(sql)
-            elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
-            return True, None, elapsed_ms
+            with sandbox(clone_conn, timeout_s=scaled_timeout) as auth:
+                authorizer = auth
+                # Set FK state for test
+                cur.execute(f"PRAGMA foreign_keys = {'ON' if fk_enabled else 'OFF'}")
+                clone_conn.executescript(sql)
+                elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+                return True, None, elapsed_ms
         except sqlite3.Error as exc:
             elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
             msg = str(exc)

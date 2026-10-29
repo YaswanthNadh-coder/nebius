@@ -1,0 +1,6 @@
+# Developer and test dependencies
+pytest==9.1.1
+hypothesis==6.170.11
+ruff==0.17.2
+pyflakes==4.0.3
+

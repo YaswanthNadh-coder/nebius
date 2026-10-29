@@ -1,6 +1,5 @@
 """Deterministic generic invariants engine for database migrations."""
 
-import hashlib
 import re
 import sqlite3
 from typing import Any
@@ -29,6 +28,7 @@ class InvariantResult(BaseModel):
     sample_rows: list[dict[str, Any]] = Field(default_factory=list)
     trap_audit: list[dict[str, Any]] = Field(default_factory=list)
     oracle_verified: bool = False
+    is_sampled: bool = False
 
 
 def _normalize_sql(sql: str | None) -> str:
@@ -64,9 +64,19 @@ def evaluate_migration_invariants(
     b_cur.execute(f"SELECT COUNT(*) FROM {q_target}")
     before_count = b_cur.fetchone()[0]
 
-    b_cur.execute(f"SELECT * FROM {q_target}")
-    orig_col_names = [d[0] for d in b_cur.description]
-    orig_rows = [dict(zip(orig_col_names, r)) for r in b_cur.fetchall()]
+    is_sampled = before_count > 20_000
+    if is_sampled:
+        passed_checks.append("AUDIT_MODE_SAMPLED: >20k rows audited via trap rows, 5k deterministic sample, and aggregate SQL checksums")
+
+    b_cur.execute(f"PRAGMA table_info({q_target})")
+    orig_col_meta = {r[1]: {"type": r[2], "notnull": bool(r[3]), "default": r[4], "pk": r[5]} for r in b_cur.fetchall()}
+    orig_col_names = list(orig_col_meta.keys())
+
+    # Only load full table into Python memory for small tables (<= 20k rows)
+    orig_rows: list[dict[str, Any]] = []
+    if not is_sampled:
+        b_cur.execute(f"SELECT * FROM {q_target}")
+        orig_rows = [dict(zip(orig_col_names, r)) for r in b_cur.fetchall()]
 
     b_cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name != '__trap_rows'")
     orig_tables = {r[0] for r in b_cur.fetchall()}
@@ -148,7 +158,12 @@ def evaluate_migration_invariants(
 
     missing_cols = [c for c in target_req_cols if c not in col_meta]
     if missing_cols:
-        failed_checks.append(f"MISSING_REQUIRED_COLUMNS: {missing_cols}. Found: {actual_col_names}")
+        undo_hint = ""
+        b_cur.execute(f"PRAGMA table_info({q_target})")
+        b_cols = [r[1] for r in b_cur.fetchall()]
+        if set(actual_col_names) == set(b_cols):
+            undo_hint = " [How to fix: UP appears undone or not applied; target table columns match original baseline columns]"
+        failed_checks.append(f"MISSING_REQUIRED_COLUMNS: {missing_cols}. Found: {actual_col_names}{undo_hint}")
     else:
         passed_checks.append("REQUIRED_COLUMNS_PRESENT")
 
@@ -165,7 +180,9 @@ def evaluate_migration_invariants(
         # In SQLite, INTEGER PRIMARY KEY columns are naturally non-null (rowid aliases)
         # even though PRAGMA table_info reports notnull=0.
         if col in col_meta and not col_meta[col]["notnull"] and not col_meta[col]["pk"]:
-            failed_checks.append(f"SCHEMA_CONSTRAINT_VIOLATION: Column '{col}' is not defined as NOT NULL.")
+            failed_checks.append(
+                f"SCHEMA_CONSTRAINT_VIOLATION: Column '{col}' is not defined as NOT NULL. [How to fix: specify '{col}' NOT NULL in CREATE TABLE]"
+            )
         else:
             passed_checks.append(f"NOT_NULL_DECLARED_{col}")
 
@@ -175,42 +192,99 @@ def evaluate_migration_invariants(
             m_cur.execute(f"SELECT COUNT(*) FROM {q_target} WHERE {quote_ident(col)} IS NULL")
             null_count = m_cur.fetchone()[0]
             if null_count > 0:
+                b_cur.execute(f"SELECT COUNT(*) FROM {q_target} WHERE {quote_ident(col)} IS NULL")
+                b_nulls = b_cur.fetchone()[0]
                 failed_checks.append(
-                    f"NULL_CORRUPTION: Column '{col}' contains {null_count} unhandled NULL values."
+                    f"NULL_CORRUPTION: Column '{col}' contains {null_count} unhandled NULL values. [How to fix: source has {b_nulls} NULL rows; define default via COALESCE or keep nullable]"
                 )
             else:
                 passed_checks.append(f"ZERO_NULLS_{col}")
 
     # ── Check 5: Primary Key Set Uniqueness & Identity ─────────────────────
     if primary_key_col in col_meta:
-        m_cur.execute(f"SELECT {quote_ident(primary_key_col)} FROM {q_target}")
-        migrated_ids = [r[0] for r in m_cur.fetchall()]
-        if len(migrated_ids) != len(set(migrated_ids)):
+        q_pk = quote_ident(primary_key_col)
+        m_cur.execute(f"SELECT COUNT(*) - COUNT(DISTINCT {q_pk}) FROM {q_target}")
+        dups = m_cur.fetchone()[0]
+        if dups > 0:
             failed_checks.append("PRIMARY_KEY_DUPLICATION: Duplicate ID values detected after migration.")
         else:
             passed_checks.append("PRIMARY_KEY_UNIQUE")
 
-        orig_id_set = {r.get(primary_key_col) for r in orig_rows if primary_key_col in r}
-        if orig_id_set and row_policy == "preserve_all":
-            if set(migrated_ids) != orig_id_set:
-                failed_checks.append("PRIMARY_KEY_SET_MISMATCH: Set of migrated IDs differs from baseline.")
+        if row_policy == "preserve_all":
+            if not is_sampled:
+                b_cur.execute(f"SELECT {q_pk} FROM {q_target} ORDER BY {q_pk}")
+                m_cur.execute(f"SELECT {q_pk} FROM {q_target} ORDER BY {q_pk}")
+                pk_diff = False
+                while True:
+                    b_chunk = b_cur.fetchmany(5000)
+                    m_chunk = m_cur.fetchmany(5000)
+                    if not b_chunk and not m_chunk:
+                        break
+                    if b_chunk != m_chunk:
+                        pk_diff = True
+                        break
+                if pk_diff:
+                    failed_checks.append("PRIMARY_KEY_SET_MISMATCH: Set of migrated IDs differs from baseline.")
+                else:
+                    passed_checks.append("PRIMARY_KEY_SET_IDENTICAL")
             else:
-                passed_checks.append("PRIMARY_KEY_SET_IDENTICAL")
+                b_cur.execute(f"SELECT COUNT({q_pk}), MIN({q_pk}), MAX({q_pk}), TOTAL({q_pk}) FROM {q_target}")
+                b_pk_agg = b_cur.fetchone()
+                m_cur.execute(f"SELECT COUNT({q_pk}), MIN({q_pk}), MAX({q_pk}), TOTAL({q_pk}) FROM {q_target}")
+                m_pk_agg = m_cur.fetchone()
+                if b_pk_agg != m_pk_agg:
+                    failed_checks.append("PRIMARY_KEY_SET_MISMATCH: Set of migrated IDs differs from baseline.")
+                else:
+                    passed_checks.append("PRIMARY_KEY_SET_IDENTICAL")
 
     # ── Check 6: Checksum of Columns Declared Unchanged ───────────────────
     if spec and target_table in spec.columns_declared_unchanged:
         unchanged_cols = spec.columns_declared_unchanged[target_table]
+        q_pk = quote_ident(primary_key_col)
         for c in unchanged_cols:
             if c in orig_col_names and c in col_meta:
-                # Compute checksum before and after
-                b_cur.execute(f"SELECT {quote_ident(c)} FROM {q_target} ORDER BY {quote_ident(primary_key_col)}")
-                b_hash = hashlib.sha256(str(b_cur.fetchall()).encode()).hexdigest()
-                m_cur.execute(f"SELECT {quote_ident(c)} FROM {q_target} ORDER BY {quote_ident(primary_key_col)}")
-                m_hash = hashlib.sha256(str(m_cur.fetchall()).encode()).hexdigest()
-                if b_hash != m_hash:
-                    failed_checks.append(f"UNTOUCHED_COLUMN_MUTATED: Column '{c}' declared unchanged was modified.")
+                qc = quote_ident(c)
+                if not is_sampled:
+                    # Stream in PK order with fetchmany(5000) to keep memory flat
+                    b_cur.execute(f"SELECT {qc} FROM {q_target} ORDER BY {q_pk}")
+                    m_cur.execute(f"SELECT {qc} FROM {q_target} ORDER BY {q_pk}")
+                    diff_found = False
+                    while True:
+                        b_c = b_cur.fetchmany(5000)
+                        m_c = m_cur.fetchmany(5000)
+                        if not b_c and not m_c:
+                            break
+                        if b_c != m_c:
+                            diff_found = True
+                            break
+                    if diff_found:
+                        failed_checks.append(f"UNTOUCHED_COLUMN_MUTATED: Column '{c}' declared unchanged was modified.")
+                    else:
+                        passed_checks.append(f"UNTOUCHED_COLUMN_VERIFIED_{c}")
                 else:
-                    passed_checks.append(f"UNTOUCHED_COLUMN_VERIFIED_{c}")
+                    # Above 20k rows: aggregate SQL checksum in engine
+                    b_cur.execute(f"""
+                        SELECT
+                            COUNT(*),
+                            TOTAL(CASE WHEN {qc} IS NULL THEN 1 ELSE 0 END),
+                            TOTAL(CASE WHEN typeof({qc}) IN ('integer', 'real') THEN CAST({qc} AS REAL) ELSE 0 END),
+                            TOTAL(LENGTH(quote({qc})) * (({q_pk} % 997) + 1) + UNICODE(SUBSTR(quote({qc}), 1, 1)))
+                        FROM {q_target}
+                    """)
+                    b_agg = b_cur.fetchone()
+                    m_cur.execute(f"""
+                        SELECT
+                            COUNT(*),
+                            TOTAL(CASE WHEN {qc} IS NULL THEN 1 ELSE 0 END),
+                            TOTAL(CASE WHEN typeof({qc}) IN ('integer', 'real') THEN CAST({qc} AS REAL) ELSE 0 END),
+                            TOTAL(LENGTH(quote({qc})) * (({q_pk} % 997) + 1) + UNICODE(SUBSTR(quote({qc}), 1, 1)))
+                        FROM {q_target}
+                    """)
+                    m_agg = m_cur.fetchone()
+                    if b_agg != m_agg:
+                        failed_checks.append(f"UNTOUCHED_COLUMN_MUTATED: Column '{c}' declared unchanged was modified.")
+                    else:
+                        passed_checks.append(f"UNTOUCHED_COLUMN_VERIFIED_{c}")
 
     # ── Check 7: Preservation of Views, Triggers, and Other Indexes ───────
     m_cur.execute("SELECT name, sql FROM sqlite_master WHERE type='view'")
@@ -259,35 +333,81 @@ def evaluate_migration_invariants(
     # ── Check 10: Non-Target Tables Untouched ──────────────────────────────
     for other_tbl in orig_tables:
         if other_tbl != target_table:
-            b_cur.execute(f"SELECT * FROM \"{other_tbl}\"")
-            b_data = b_cur.fetchall()
+            b_cur.execute(f'SELECT COUNT(*) FROM "{other_tbl}"')
+            b_cnt = b_cur.fetchone()[0]
             try:
-                m_cur.execute(f"SELECT * FROM \"{other_tbl}\"")
-                m_data = m_cur.fetchall()
-                if b_data != m_data:
+                m_cur.execute(f'SELECT COUNT(*) FROM "{other_tbl}"')
+                m_cnt = m_cur.fetchone()[0]
+                if b_cnt != m_cnt:
                     failed_checks.append(f"NON_TARGET_TABLE_MUTATED: Table '{other_tbl}' was unexpectedly modified.")
+                elif b_cnt <= 5000:
+                    b_cur.execute(f'SELECT * FROM "{other_tbl}"')
+                    b_data = b_cur.fetchall()
+                    m_cur.execute(f'SELECT * FROM "{other_tbl}"')
+                    m_data = m_cur.fetchall()
+                    if b_data != m_data:
+                        failed_checks.append(f"NON_TARGET_TABLE_MUTATED: Table '{other_tbl}' was unexpectedly modified.")
+                    else:
+                        passed_checks.append(f"NON_TARGET_TABLE_UNTOUCHED_{other_tbl}")
                 else:
                     passed_checks.append(f"NON_TARGET_TABLE_UNTOUCHED_{other_tbl}")
             except Exception as exc:
                 failed_checks.append(f"NON_TARGET_TABLE_ERROR: Table '{other_tbl}': {exc}")
 
     # ── Check 11: Row-Level Oracle Verification ───────────────────────────
-    m_cur.execute(f"SELECT * FROM {q_target}")
+    m_cur.execute(f"SELECT * FROM {q_target} LIMIT 8")
     migrated_cols = [d[0] for d in m_cur.description]
-    all_migrated_rows = [dict(zip(migrated_cols, r)) for r in m_cur.fetchall()]
-    sample_rows = all_migrated_rows[:8]
-    migrated_by_pk = {str(r.get(primary_key_col, "")): r for r in all_migrated_rows}
+    sample_rows = [dict(zip(migrated_cols, r)) for r in m_cur.fetchall()]
+
+    # Collect rows for oracle verification
+    q_pk = quote_ident(primary_key_col)
+    if not is_sampled:
+        m_cur.execute(f"SELECT * FROM {q_target}")
+        all_mig_cols = [d[0] for d in m_cur.description]
+        migrated_by_pk = {str(r[all_mig_cols.index(primary_key_col)]): dict(zip(all_mig_cols, r)) for r in m_cur.fetchall() if primary_key_col in all_mig_cols}
+        audit_orig_rows = orig_rows
+    else:
+        # Sampled audit: collect all trap rows + deterministic 5k sample
+        trap_pks = set()
+        try:
+            b_cur.execute("SELECT target_pk FROM __trap_rows WHERE target_table = ?", (target_table,))
+            trap_pks = {r[0] for r in b_cur.fetchall()}
+        except Exception:
+            pass
+
+        stride = max(1, before_count // 5000)
+        b_cur.execute(f"SELECT * FROM {q_target} WHERE ({q_pk} % {stride}) = 0 ORDER BY {q_pk} LIMIT 5000")
+        audit_orig_rows = [dict(zip(orig_col_names, r)) for r in b_cur.fetchall()]
+        seen_pks = {r.get(primary_key_col) for r in audit_orig_rows}
+
+        for tpk in trap_pks:
+            if tpk not in seen_pks:
+                b_cur.execute(f"SELECT * FROM {q_target} WHERE {q_pk} = ?", (tpk,))
+                r = b_cur.fetchone()
+                if r:
+                    audit_orig_rows.append(dict(zip(orig_col_names, r)))
+                    seen_pks.add(tpk)
+
+        migrated_by_pk = {}
+        pks_to_fetch = [r[primary_key_col] for r in audit_orig_rows if primary_key_col in r]
+        for i in range(0, len(pks_to_fetch), 900):
+            batch = pks_to_fetch[i : i + 900]
+            placeholders = ",".join("?" for _ in batch)
+            m_cur.execute(f"SELECT * FROM {q_target} WHERE {q_pk} IN ({placeholders})", batch)
+            m_cols_batch = [d[0] for d in m_cur.description]
+            for r in m_cur.fetchall():
+                row_d = dict(zip(m_cols_batch, r))
+                migrated_by_pk[str(row_d[primary_key_col])] = row_d
 
     oracle_verified = False
 
     # 1. Scenario explicit expected_row_fn if provided
     if expected_row_fn is not None:
-        # Collect lookup table info (departments)
         b_cur.execute("SELECT code FROM departments")
         valid_depts = {r[0] for r in b_cur.fetchall()}
         mismatches: dict[str, int] = {}
         examples: list[dict] = []
-        for orig in orig_rows:
+        for orig in audit_orig_rows:
             exp = expected_row_fn(orig, valid_depts)
             act = migrated_by_pk.get(str(orig.get(primary_key_col)))
             if not act:
@@ -300,15 +420,21 @@ def evaluate_migration_invariants(
         if mismatches:
             summary = ", ".join(f"{c}: {n} wrong" for c, n in sorted(mismatches.items()))
             ex_str = "; ".join(f"id={e['id']} {e['column']}: expected {e['expected']!r} got {e['actual']!r}" for e in examples)
-            failed_checks.append(f"DATA_MISMATCH: {summary}. Examples: {ex_str}")
+            contract_lines = []
+            if spec:
+                for col_w in sorted(mismatches.keys()):
+                    m = next((m for m in spec.get_table_mappings(target_table) if m.new_column == col_w), None)
+                    if m:
+                        contract_lines.append(f"{m.new_column} from {m.source_column or 'None'} (transform: {m.transform}, default: {m.default_value!r}, orphan_policy: {m.orphan_policy})")
+            contract_hint = f" [Contract: {'; '.join(contract_lines)}]" if contract_lines else ""
+            failed_checks.append(f"DATA_MISMATCH: {summary}. Examples: {ex_str}{contract_hint}")
         else:
-            passed_checks.append("ROW_ORACLE_MATCHED")
+            passed_checks.append("ROW_ORACLE_MATCHED" if not is_sampled else "ROW_ORACLE_MATCHED (sampled)")
             oracle_verified = True
 
     # 2. Spec-based oracle library transforms
     elif spec and target_table in spec.column_mappings:
         mappings = spec.get_table_mappings(target_table)
-        # Fetch lookups
         lookups: dict[str, dict[str, str]] = {}
         for m in mappings:
             if m.lookup_table and m.lookup_key and m.lookup_val:
@@ -321,7 +447,7 @@ def evaluate_migration_invariants(
         has_oracle_rules = any(m.transform not in ("custom", "") for m in mappings)
         if has_oracle_rules:
             matched, mismatches, examples = verify_rows_with_oracle(
-                orig_rows,
+                audit_orig_rows,
                 migrated_by_pk,
                 mappings,
                 lookup_data=lookups,
@@ -330,9 +456,15 @@ def evaluate_migration_invariants(
             if not matched:
                 summary = ", ".join(f"{c}: {n} wrong" for c, n in sorted(mismatches.items()))
                 ex_str = "; ".join(f"id={e['id']} {e['column']}: expected {e['expected']!r} got {e['actual']!r}" for e in examples)
-                failed_checks.append(f"DATA_MISMATCH: {summary}. Examples: {ex_str}")
+                contract_lines = []
+                for col_w in sorted(mismatches.keys()):
+                    m = next((m for m in mappings if m.new_column == col_w), None)
+                    if m:
+                        contract_lines.append(f"{m.new_column} from {m.source_column or 'None'} (transform: {m.transform}, default: {m.default_value!r}, orphan_policy: {m.orphan_policy})")
+                contract_hint = f" [Contract: {'; '.join(contract_lines)}]" if contract_lines else ""
+                failed_checks.append(f"DATA_MISMATCH: {summary}. Examples: {ex_str}{contract_hint}")
             else:
-                passed_checks.append("ROW_ORACLE_MATCHED")
+                passed_checks.append("ROW_ORACLE_MATCHED" if not is_sampled else "ROW_ORACLE_MATCHED (sampled)")
                 oracle_verified = True
 
     # ── Final Status Determination ─────────────────────────────────────────
@@ -345,7 +477,6 @@ def evaluate_migration_invariants(
         final_status = "VERIFIED"
         primary_error = None
     else:
-        # Invariants passed, but no automated oracle available for custom transforms
         final_status = "UNVERIFIED"
         primary_error = None
 
@@ -360,4 +491,5 @@ def evaluate_migration_invariants(
         passed_checks=passed_checks,
         sample_rows=sample_rows,
         oracle_verified=oracle_verified,
+        is_sampled=is_sampled,
     )

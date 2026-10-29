@@ -30,6 +30,7 @@ class ColumnMapping(BaseModel):
     transform: TransformType = "passthrough"
     null_policy: str = "nullable"   # not_null, nullable
     default_value: Any | None = None
+    orphan_policy: str = "null"     # "null", "default:<value>", "reject"
     lookup_table: str | None = None
     lookup_key: str | None = None
     lookup_val: str | None = None

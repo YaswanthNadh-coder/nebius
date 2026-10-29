@@ -24,10 +24,22 @@ from timemachine.report.writer import (
     generate_markdown_report,
     wrap_transaction_with_prechecks,
 )
-from timemachine.traps.profiler import mask_value, profile_database
+from timemachine.scenarios import get_builtin_scenario_reference, validate_spec_satisfiability
+from timemachine.traps.profiler import (
+    get_cached_profile,
+    mask_value,
+    profile_database,
+    set_cached_profile,
+)
 from timemachine.verify.spec import MigrationSpec
 
 logger = get_logger("ui.app_view")
+
+
+@st.cache_data
+def get_cached_introspect(fingerprint: str, _adapter: Any) -> Any:
+    """Cache introspected database schema keyed by database source fingerprint."""
+    return _adapter.introspect()
 
 
 def init_session_state():
@@ -36,7 +48,7 @@ def init_session_state():
         "adapter": None,
         "adapter_name": "Built-in: Employees Normalization",
         "target_table": "employees",
-        "goal": "Normalize department into a separate departments table and split full_name into first_name and last_name.",
+        "goal": "Split full_name into first_name/last_name and add a foreign key department_code -> departments(dept_code); orphan codes and NULLs become NULL.",
         "spec": None,
         "spec_approved": False,
         "spec_source": "",
@@ -244,7 +256,7 @@ def render_connect_tab():
             adapter = create_builtin_scenario_adapter(1)
             set_source(adapter, "Scenario 1", fp)
             st.session_state["target_table"] = "employees"
-            st.session_state["goal"] = "Normalize department into a separate departments table and split full_name into first_name and last_name."
+            st.session_state["goal"] = "Split full_name into first_name/last_name and add a foreign key department_code -> departments(dept_code); orphan codes and NULLs become NULL."
 
     elif source_type == "Built-in Scenario: Salary Banding":
         fp = "builtin:scenario_2"
@@ -374,7 +386,7 @@ def render_plan_tab():
         st.session_state["spec_approved"] = False
         st.session_state["run_result"] = None
 
-    col1, col2 = st.columns([1, 1])
+    col1, col2, col3 = st.columns([1, 1, 1])
     generate_clicked = False
     with col1:
         if st.button("🤖 Generate Migration Spec (Nemotron Super)", width="stretch"):
@@ -383,6 +395,22 @@ def render_plan_tab():
         if st.session_state.get("spec") is not None:
             if st.button("🔄 Regenerate Migration Spec", width="stretch"):
                 generate_clicked = True
+    with col3:
+        if st.button("🧪 Validate spec", width="stretch"):
+            target_t = st.session_state.get("target_table", "employees")
+            scenario_name = st.session_state.get("source_name", "")
+            scenario_id = 1 if "Scenario 1" in scenario_name else (2 if "Scenario 2" in scenario_name else 1)
+            try:
+                ref_up, ref_down, ref_spec = get_builtin_scenario_reference(scenario_id)
+                current_spec = st.session_state.get("spec") or ref_spec
+                with st.spinner("Running reference rebuild satisfiability check in sandbox..."):
+                    val_res = validate_spec_satisfiability(current_spec, adapter, ref_up, target_table=target_t)
+                if val_res.passed:
+                    st.success("✅ Spec validation PASSED: reference rebuild satisfied all invariants and oracle checks.")
+                else:
+                    st.error(f"❌ Spec validation FAILED: {'; '.join(val_res.failed_checks)}")
+            except Exception as e:
+                st.error(f"Spec validation error: {e}")
 
     if generate_clicked:
         st.session_state["run_result"] = None
@@ -394,15 +422,20 @@ def render_plan_tab():
                 for w in warns:
                     st.warning(w)
 
-                schema = adapter.introspect()
-                clone = adapter.clone()
-                try:
-                    profiles = profile_database(clone, schema)
-                except Exception as p_exc:
-                    logger.debug(f"Could not compute profiles: {p_exc}")
-                    profiles = {}
-                finally:
-                    clone.close()
+                fp = st.session_state.get("source_fingerprint", "default")
+                schema = get_cached_introspect(fp, adapter)
+                traps = st.session_state.get("inject_traps", True)
+                profiles = get_cached_profile(fp, traps)
+                if profiles is None:
+                    clone = adapter.clone()
+                    try:
+                        profiles = profile_database(clone, schema)
+                        set_cached_profile(fp, traps, profiles)
+                    except Exception as p_exc:
+                        logger.debug(f"Could not compute profiles: {p_exc}")
+                        profiles = {}
+                    finally:
+                        clone.close()
 
                 target_t = st.session_state.get("target_table", "employees")
                 spec_res = generate_spec(
@@ -667,32 +700,33 @@ def render_result_tab():
 
 
 def render_history_tab():
-    """Tab 5: Local history of past dry-run executions."""
+    """Tab 5: Local history of past dry-run executions (lazy loaded)."""
     st.header("5. Run History & Telemetry Logs")
-    history = load_run_history(limit=25)
-    if not history:
-        st.info("No prior migration dry-run executions logged yet.")
-        return
+    with st.expander("📜 Click to expand run history and telemetry logs", expanded=False):
+        history = load_run_history(limit=25)
+        if not history:
+            st.info("No prior migration dry-run executions logged yet.")
+            return
 
-    for h in history:
-        status_icon = "🟢" if h["status"] == "VERIFIED" else ("🟡" if h["status"] == "UNVERIFIED" else "🔴")
-        with st.expander(f"{status_icon} Run #{h['id']} - {h['target_table']} ({h['timestamp']}) - {h['status']}"):
-            st.write(f"**Goal:** {h['goal']}")
-            st.write(f"**Latency:** {round(h['latency_ms'] / 1000, 2)}s | **Steps:** {h['steps_count']} | **Rollback:** {'Yes' if h['rollback_verified'] else 'No'}")
-            st.code(h["up_sql"], language="sql")
-            if h.get("report_json"):
-                try:
-                    rep = json.loads(h["report_json"])
-                    if rep.get("attempts"):
-                        st.markdown("**Attempts & Raw Model Replies:**")
-                        for att in rep["attempts"]:
-                            att_num = att.get("attempt", 1)
-                            att_model = att.get("model", "")
-                            att_raw = (att.get("raw_reply") or "")[:1000]
-                            with st.expander(f"Attempt #{att_num} ({att_model}) Raw Reply", expanded=False):
-                                st.code(att_raw or "(no raw reply)", language="text")
-                except Exception:
-                    pass
+        for h in history:
+            status_icon = "🟢" if h["status"] == "VERIFIED" else ("🟡" if h["status"] == "UNVERIFIED" else "🔴")
+            with st.expander(f"{status_icon} Run #{h['id']} - {h['target_table']} ({h['timestamp']}) - {h['status']}"):
+                st.write(f"**Goal:** {h['goal']}")
+                st.write(f"**Latency:** {round(h['latency_ms'] / 1000, 2)}s | **Steps:** {h['steps_count']} | **Rollback:** {'Yes' if h['rollback_verified'] else 'No'}")
+                st.code(h["up_sql"], language="sql")
+                if h.get("report_json"):
+                    try:
+                        rep = json.loads(h["report_json"])
+                        if rep.get("attempts"):
+                            st.markdown("**Attempts & Raw Model Replies:**")
+                            for att in rep["attempts"]:
+                                att_num = att.get("attempt", 1)
+                                att_model = att.get("model", "")
+                                att_raw = (att.get("raw_reply") or "")[:1000]
+                                with st.expander(f"Attempt #{att_num} ({att_model}) Raw Reply", expanded=False):
+                                    st.code(att_raw or "(no raw reply)", language="text")
+                    except Exception:
+                        pass
 
 
 def render_app():

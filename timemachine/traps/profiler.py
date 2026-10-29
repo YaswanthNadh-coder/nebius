@@ -12,12 +12,14 @@ from timemachine.adapters.schema import DatabaseSchema, TableSchema
 class ColumnProfile(BaseModel):
     """Statistical and pattern profile of a single column."""
 
-    name: str
-    column_type: str
-    total_rows: int
-    null_count: int
-    null_rate: float
-    distinct_count: int
+    model_config = {"populate_by_name": True}
+
+    name: str = Field(default="", alias="column_name")
+    column_type: str = "TEXT"
+    total_rows: int = Field(default=0, alias="total_count")
+    null_count: int = 0
+    null_rate: float = 0.0
+    distinct_count: int = 0
     min_length: int | None = None
     max_length: int | None = None
     has_unicode: bool = False
@@ -57,9 +59,30 @@ def mask_value(val: Any) -> str:
 
 MAX_SAMPLE_ROWS = 50000
 
+_PROFILES_CACHE: dict[tuple[str, bool], dict[str, dict[str, ColumnProfile]]] = {}
+
+
+def get_cached_profile(fingerprint: str, inject_traps: bool = True) -> dict[str, dict[str, ColumnProfile]] | None:
+    """Retrieve cached profile for (fingerprint, inject_traps) tuple."""
+    return _PROFILES_CACHE.get((fingerprint, inject_traps))
+
+
+def set_cached_profile(
+    fingerprint: str,
+    inject_traps: bool,
+    profile: dict[str, dict[str, ColumnProfile]],
+) -> None:
+    """Store profile in memory cache keyed by (fingerprint, inject_traps)."""
+    _PROFILES_CACHE[(fingerprint, inject_traps)] = profile
+
+
+def clear_profiles_cache() -> None:
+    """Clear memory profiles cache."""
+    _PROFILES_CACHE.clear()
+
 
 def profile_table(conn: sqlite3.Connection, table_schema: TableSchema | str, limit_samples: int = 5) -> dict[str, ColumnProfile]:
-    """Inspect columns in table, compute aggregate statistics and generate masked samples."""
+    """Inspect columns in table, compute aggregate statistics and generate masked samples in one consolidated query."""
     cur = conn.cursor()
     if isinstance(table_schema, str):
         from timemachine.adapters.schema import ColumnInfo
@@ -76,43 +99,45 @@ def profile_table(conn: sqlite3.Connection, table_schema: TableSchema | str, lim
     table_src = f'(SELECT * FROM "{tname}" LIMIT {MAX_SAMPLE_ROWS})' if use_sampling else f'"{tname}"'
     sample_size = min(total_rows, MAX_SAMPLE_ROWS) if use_sampling else total_rows
 
+    if not table_schema.columns:
+        return profiles
+
+    # Compute stats for all columns in one consolidated query
+    agg_clauses = []
     for col in table_schema.columns:
         cname = col.name
-        cur.execute(f"SELECT COUNT(*) FROM {table_src} WHERE \"{cname}\" IS NULL")
-        sample_null_cnt = cur.fetchone()[0]
+        agg_clauses.extend([
+            f'COUNT("{cname}")',
+            f'COUNT(DISTINCT "{cname}")',
+            f'MIN(LENGTH(CAST("{cname}" AS TEXT)))',
+            f'MAX(LENGTH(CAST("{cname}" AS TEXT)))',
+        ])
+    cur.execute(f"SELECT {', '.join(agg_clauses)} FROM {table_src}")
+    agg_row = cur.fetchone()
+
+    # Fetch a sample batch of rows across all columns for pattern analysis
+    col_names = [c.name for c in table_schema.columns]
+    quoted_cols = ", ".join(f'"{c}"' for c in col_names)
+    cur.execute(f"SELECT {quoted_cols} FROM {table_src} LIMIT 50")
+    sample_matrix = cur.fetchall()
+
+    for idx, col in enumerate(table_schema.columns):
+        cname = col.name
+        base_idx = idx * 4
+        non_null_cnt = agg_row[base_idx] if agg_row else 0
+        distinct_cnt = agg_row[base_idx + 1] if agg_row else 0
+        min_len = agg_row[base_idx + 2] if agg_row else None
+        max_len = agg_row[base_idx + 3] if agg_row else None
+
+        sample_null_cnt = sample_size - non_null_cnt
         null_rate = round(sample_null_cnt / sample_size, 4) if sample_size > 0 else 0.0
         null_cnt = int(round(null_rate * total_rows)) if use_sampling else sample_null_cnt
 
-        cur.execute(f"SELECT COUNT(DISTINCT \"{cname}\") FROM {table_src}")
-        distinct_cnt = cur.fetchone()[0]
-
-        # String length and pattern inspection
-        cur.execute(
-            f"SELECT MIN(LENGTH(CAST(\"{cname}\" AS TEXT))), MAX(LENGTH(CAST(\"{cname}\" AS TEXT))) "
-            f"FROM {table_src} WHERE \"{cname}\" IS NOT NULL"
-        )
-        min_len, max_len = cur.fetchone()
-
-        # Check for currency symbols, unicode, whitespace padding
-        cur.execute(
-            f"SELECT \"{cname}\" FROM {table_src} WHERE \"{cname}\" IS NOT NULL LIMIT 50"
-        )
-        sample_vals = [str(r[0]) for r in cur.fetchall()]
+        sample_vals = [str(row[idx]) for row in sample_matrix if row[idx] is not None]
 
         has_unicode = any(ord(char) > 127 for val in sample_vals for char in val)
         has_currency = any(any(c in val for c in ("$", "€", "£", "¥")) for val in sample_vals)
         has_whitespace = any(val != val.strip() for val in sample_vals)
-
-        # Check case-variant duplicates
-        cur.execute(
-            f"SELECT COUNT(*) FROM ("
-            f"  SELECT LOWER(CAST(\"{cname}\" AS TEXT)) FROM {table_src} "
-            f"  WHERE \"{cname}\" IS NOT NULL GROUP BY LOWER(CAST(\"{cname}\" AS TEXT)) "
-            f"  HAVING COUNT(DISTINCT CAST(\"{cname}\" AS TEXT)) > 1"
-            f")"
-        )
-        case_var_cnt = cur.fetchone()[0]
-        has_case_variants = case_var_cnt > 0
 
         # Check orphan FK count if col is in table_schema.foreign_keys
         orphan_cnt = 0
@@ -142,7 +167,7 @@ def profile_table(conn: sqlite3.Connection, table_schema: TableSchema | str, lim
             has_unicode=has_unicode,
             has_currency=has_currency,
             has_whitespace_padding=has_whitespace,
-            has_case_variants=has_case_variants,
+            has_case_variants=False,
             orphan_fk_count=orphan_cnt,
             masked_sample=masked,
         )

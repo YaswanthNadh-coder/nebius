@@ -135,6 +135,10 @@ class Settings(BaseModel):
         default=2.0,
         description="Sandbox query timeout deadline in seconds",
     )
+    verification_timeout_s: float = Field(
+        default=10.0,
+        description="Verification query timeout deadline in seconds (longer than sandbox execution timeout)",
+    )
     db_size_cap_mb: float = Field(
         default=200.0,
         description="Maximum source database file size allowed into RAM clone",

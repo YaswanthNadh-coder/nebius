@@ -16,12 +16,19 @@ from timemachine.agent.planner import generate_spec, validate_spec_against_schem
 from timemachine.agent.prompts import (
     build_migration_prompt,
     build_repair_prompt,
+    format_schema_summary,
+    generate_transform_contract,
+    get_sqlite_gotchas_block,
 )
 from timemachine.agent.tools import TOOL_DEFINITIONS, ToolExecutor
 from timemachine.config import AgentError, get_settings
 from timemachine.logging import get_logger
 from timemachine.traps.generator import audit_traps
-from timemachine.traps.profiler import profile_database
+from timemachine.traps.profiler import (
+    get_cached_profile,
+    profile_database,
+    set_cached_profile,
+)
 from timemachine.verify.invariants import InvariantResult, evaluate_migration_invariants
 from timemachine.verify.rebuild import estimate_production_lock_time, verify_rollback_roundtrip
 from timemachine.verify.spec import MigrationSpec
@@ -55,6 +62,168 @@ class AttemptRecord(BaseModel):
     down_sql: str = ""
     tool_rounds_used: int = 0
     no_sql_replies: int = 0
+    split_rule: str = ""
+
+
+class AttemptHistoryRecord(BaseModel):
+    """Compact history record for multi-attempt memory."""
+    attempt_num: int
+    model: str
+    sql_hash: str
+    approach_summary: str
+    failed_check_types: list[str] = Field(default_factory=list)
+    failed_check_messages: list[str] = Field(default_factory=list)
+    passed_check_types: list[str] = Field(default_factory=list)
+    up_sql: str = ""
+    down_sql: str = ""
+    split_rule: str = ""
+
+
+class AttemptHistory:
+    """Tracks history across repair attempts to prevent regressions and accumulate requirements."""
+
+    def __init__(self):
+        self.records: list[AttemptHistoryRecord] = []
+        self._all_seen_failures: dict[str, str] = {}  # check_type -> requirement text
+
+    @staticmethod
+    def normalize_check_type(check_msg: str) -> str:
+        """Extract a canonical check category from a failure message."""
+        upper = check_msg.upper()
+        if "NOT NULL" in upper:
+            m = re.search(r"NOT NULL constraint failed:\s*([\w\.]+)", check_msg, re.IGNORECASE)
+            col = m.group(1).split(".")[-1] if m else "general"
+            return f"NOT_NULL:{col}"
+        if "UNTOUCHED_COLUMN_MUTATED" in upper or "UNTOUCHED" in upper:
+            m = re.search(r"Column '([\w]+)'", check_msg)
+            col = m.group(1) if m else "general"
+            return f"UNTOUCHED:{col}"
+        if "SCHEMA_CONSTRAINT_VIOLATION" in upper:
+            m = re.search(r"Column '([\w]+)'", check_msg)
+            col = m.group(1) if m else "general"
+            return f"SCHEMA_CONSTRAINT:{col}"
+        if "FOREIGN KEY" in upper or "FOREIGN_KEY" in upper:
+            return "FOREIGN_KEY"
+        if "DATA_MISMATCH" in upper or "MISMATCH" in upper:
+            m = re.search(r"([\w]+):\s*\d+\s*wrong", check_msg)
+            col = m.group(1) if m else "transform"
+            return f"DATA_MISMATCH:{col}"
+        if "LOST_INDEX" in upper:
+            m = re.search(r"Index '([\w]+)'", check_msg)
+            idx = m.group(1) if m else "index"
+            return f"LOST_INDEX:{idx}"
+        if "LOST_TRIGGER" in upper:
+            m = re.search(r"Trigger '([\w]+)'", check_msg)
+            trg = m.group(1) if m else "trigger"
+            return f"LOST_TRIGGER:{trg}"
+        if "LOST_VIEW" in upper:
+            m = re.search(r"View '([\w]+)'", check_msg)
+            vw = m.group(1) if m else "view"
+            return f"LOST_VIEW:{vw}"
+        if "ROW_LOSS" in upper or "SILENT_DATA_LOSS" in upper:
+            return "ROW_LOSS"
+        if "UP_UNDONE" in upper:
+            return "UP_UNDONE"
+        return upper.split(":")[0].strip() if ":" in upper else upper[:30].strip()
+
+    def record_attempt(
+        self,
+        attempt_num: int,
+        model: str,
+        up_sql: str,
+        inv_result: InvariantResult | None,
+        down_sql: str = "",
+        split_rule: str = "",
+    ) -> None:
+        """Record an attempt's telemetry and failures."""
+        sql_hash = hashlib.sha256(normalize_sql_for_progress(up_sql).encode()).hexdigest()[:8] if up_sql else "none"
+
+        # Construct 200-char approach summary from the UP SQL
+        sql_clean = re.sub(r"\s+", " ", up_sql or "").strip()
+        approach = sql_clean[:200] if sql_clean else "No executable SQL"
+
+        failed_types: list[str] = []
+        failed_msgs: list[str] = []
+        passed_types: list[str] = []
+
+        if inv_result:
+            for fc in inv_result.failed_checks:
+                ctype = self.normalize_check_type(fc)
+                failed_types.append(ctype)
+                failed_msgs.append(fc)
+                # Store discovered requirement
+                if ctype not in self._all_seen_failures:
+                    self._all_seen_failures[ctype] = self._derive_requirement(ctype, fc)
+            for pc in inv_result.passed_checks:
+                passed_types.append(pc)
+
+        rec = AttemptHistoryRecord(
+            attempt_num=attempt_num,
+            model=model,
+            sql_hash=sql_hash,
+            approach_summary=approach,
+            failed_check_types=failed_types,
+            failed_check_messages=failed_msgs,
+            passed_check_types=passed_types,
+            up_sql=up_sql,
+            down_sql=down_sql,
+            split_rule=split_rule,
+        )
+        self.records.append(rec)
+
+    def _derive_requirement(self, ctype: str, msg: str) -> str:
+        """Derive actionable rule requirement from failure type."""
+        if ctype.startswith("NOT_NULL:"):
+            col = ctype.split(":", 1)[1]
+            return f"Column '{col}' must be explicitly included in INSERT/SELECT or declared nullable if nullable in baseline."
+        if ctype.startswith("UNTOUCHED:"):
+            col = ctype.split(":", 1)[1]
+            return f"Column '{col}' declared unchanged must be copied directly without transformation or mutation."
+        if ctype.startswith("SCHEMA_CONSTRAINT:"):
+            col = ctype.split(":", 1)[1]
+            return f"Column '{col}' schema definition must preserve original constraints and nullability."
+        if ctype == "FOREIGN_KEY":
+            return "Orphan foreign keys must be mapped or inserted into the parent table before PRAGMA foreign_key_check."
+        if ctype.startswith("DATA_MISMATCH:"):
+            col = ctype.split(":", 1)[1]
+            return f"Transformation for '{col}' must match Transform Contract (strip tabs and carriage returns)."
+        if ctype.startswith("LOST_INDEX:"):
+            idx = ctype.split(":", 1)[1]
+            return f"Index '{idx}' must be recreated after table rename."
+        if ctype.startswith("LOST_TRIGGER:"):
+            trg = ctype.split(":", 1)[1]
+            return f"Trigger '{trg}' must be recreated after table rename."
+        if ctype == "UP_UNDONE":
+            return "Do not include rollback / undo statements inside up_sql; keep UP and DOWN strictly separated."
+        return f"Resolve check: {msg[:100]}"
+
+    def get_discovered_requirements(self) -> list[str]:
+        """Return cumulative union of all requirements discovered across attempts."""
+        return list(self._all_seen_failures.values())
+
+    def check_reintroduced_failures(self, current_failed_checks: list[str]) -> list[str]:
+        """Detect if any failure in the current attempt was previously fixed in an earlier attempt."""
+        if len(self.records) < 2:
+            return []
+
+        reintroduced: list[str] = []
+        prev_rec = self.records[-1]  # immediate previous attempt
+        prev_failed_types = set(prev_rec.failed_check_types)
+
+        # Look at attempts before the immediate previous one
+        earlier_failed_types = set()
+        for r in self.records[:-1]:
+            earlier_failed_types.update(r.failed_check_types)
+
+        for fc in current_failed_checks:
+            ctype = self.normalize_check_type(fc)
+            # If it failed earlier, was fixed in the immediate previous attempt, and has failed again:
+            if ctype in earlier_failed_types and ctype not in prev_failed_types:
+                reintroduced.append(
+                    f"Warning: Failure on '{ctype}' was resolved in attempt {prev_rec.attempt_num} but reintroduced now! Maintain all previously established fixes."
+                )
+
+        return reintroduced
 
 
 class AgentRunResult(BaseModel):
@@ -140,31 +309,64 @@ def truncate_older_tool_results(
     return truncated_messages
 
 
-def parse_sql_scripts(content: str) -> tuple[str, str]:
-    """Parse UP and optional DOWN migration scripts from LLM content without guessing by position."""
+def parse_sql_scripts_ex(content: str) -> tuple[str, str, str]:
+    """Parse UP and optional DOWN migration scripts from LLM content with rule tracking.
+
+    Returns:
+        (up_sql, down_sql, rule_matched)
+    """
     text = content.replace("\r\n", "\n")
+    down_keywords = r"(?:down|rollback|revert|undo|reverse|backward|migrate[ \t]+down)"
+    banner_chars = r"[-=*~_# \t]"
+
+    down_line_pattern = re.compile(
+        r"(?im)^[ \t]*(?:"
+        r"(?:```[a-zA-Z0-9_-]*[ \t]*)?"
+        r"(?:--|/\*|#+)" + banner_chars + r"*\b" + down_keywords + r"\b" + banner_chars + r"*(?:\*/)?[^\r\n]*|"
+        r"\*\*" + banner_chars + r"*\b" + down_keywords + r"\b" + banner_chars + r"*:?[ \t]*\*\*[^\r\n]*|"
+        r"[-=*~_#]{2,}[ \t]*\b" + down_keywords + r"\b[ \t]*[-=*~_#]{2,}[^\r\n]*"
+        r")$"
+    )
+    down_tag_pattern = re.compile(r"(?i)\b" + down_keywords + r"\b")
 
     # 1. Check for fenced blocks first
-    fence_pattern = re.compile(
-        r"(?:^|\n)```([^\n]*)\n(.*?)\n```",
-        re.DOTALL,
-    )
+    fence_pattern = re.compile(r"(?:^|\n)```([^\n]*)\n(.*?)\n```", re.DOTALL)
     matches = list(fence_pattern.finditer(text))
+
     if matches:
+        # Check single fence internal split
+        if len(matches) == 1:
+            body = matches[0].group(2)
+            internal_match = down_line_pattern.search(body)
+            if internal_match:
+                up_part = body[:internal_match.start()]
+                down_part = body[internal_match.end():]
+                up = _clean_sql_section(up_part)
+                down = _clean_sql_section(down_part)
+                if has_ddl_or_dml(down):
+                    return up, down, "single_fence_banner_split"
+
         down_start_idx = None
-        for i, m in enumerate(matches):
-            tag = m.group(1).lower()
-            block_body = m.group(2).strip().lower()
-            if "down" in tag or "rollback" in tag:
+        matched_rule = ""
+        # IMPORTANT: prose before the FIRST block must NEVER mark block 0 as DOWN.
+        for i in range(1, len(matches)):
+            tag = matches[i].group(1).strip()
+            block_body = matches[i].group(2).strip()
+            prev_end = matches[i - 1].end()
+            prose = text[prev_end:matches[i].start()].strip()
+
+            if down_tag_pattern.search(tag):
                 down_start_idx = i
+                matched_rule = f"fence_tag_{tag}"
                 break
-            if block_body.startswith(("-- down", "--down", "-- rollback", "--rollback")):
+            first_line = block_body.split("\n", 1)[0] if block_body else ""
+            if down_line_pattern.search(first_line):
                 down_start_idx = i
+                matched_rule = "code_first_line_comment"
                 break
-            prev_end = matches[i - 1].end() if i > 0 else 0
-            prose = text[prev_end:m.start()].strip()
-            if re.search(r"(?im)\b(?:down|rollback)\b", prose):
+            if down_line_pattern.search(prose) or down_tag_pattern.search(prose):
                 down_start_idx = i
+                matched_rule = "prose_marker_before_fence"
                 break
 
         if down_start_idx is not None and down_start_idx > 0:
@@ -174,26 +376,47 @@ def parse_sql_scripts(content: str) -> tuple[str, str]:
             down = "\n\n".join(b for b in down_blocks if b)
             if not has_ddl_or_dml(down):
                 down = ""
-            return up, down
+            return up, down, matched_rule
 
-    # 2. Split on a down/rollback line (either plain comment or fence opening with down/rollback comment)
-    down_line_re = re.compile(r"(?im)^\s*(?:```[a-zA-Z0-9_-]*\s*)?--\s*(?:DOWN|ROLLBACK)\b.*$")
-    match = down_line_re.search(text)
+        # If 2+ blocks and no inter-fence marker, check if block 0 has an internal banner
+        if len(matches) > 1:
+            body0 = matches[0].group(2)
+            m0 = down_line_pattern.search(body0)
+            if m0:
+                up_part = body0[:m0.start()]
+                down_part = body0[m0.end():]
+                up = _clean_sql_section(up_part)
+                down = _clean_sql_section(down_part)
+                if has_ddl_or_dml(down):
+                    return up, down, "first_fence_banner_split"
+
+        if len(matches) >= 2:
+            all_blocks = [_clean_extracted_block(m.group(2)) for m in matches if m.group(2).strip()]
+            up = "\n\n".join(b for b in all_blocks if b)
+            return up, "", "multiple_blocks_no_marker"
+
+    # 2. Split on a down/rollback line without code fences
+    match = down_line_pattern.search(text)
     if match:
         up_part = text[:match.start()]
         down_part = text[match.end():]
         up = _clean_sql_section(up_part)
         down = _clean_sql_section(down_part)
-        if not has_ddl_or_dml(down):
-            down = ""
-        return up, down
+        if has_ddl_or_dml(down):
+            return up, down, "text_line_marker_split"
 
     if matches:
         all_blocks = [_clean_extracted_block(m.group(2)) for m in matches if m.group(2).strip()]
         up = "\n\n".join(b for b in all_blocks if b)
-        return up, ""
+        return up, "", "fenced_blocks_up_only"
 
-    return clean_sql(text), ""
+    return clean_sql(text), "", "fallback_clean_sql"
+
+
+def parse_sql_scripts(content: str) -> tuple[str, str]:
+    """Parse UP and optional DOWN migration scripts from LLM content without guessing by position."""
+    up, down, _ = parse_sql_scripts_ex(content)
+    return up, down
 
 
 def run_time_machine_agent(
@@ -230,6 +453,10 @@ def run_time_machine_agent(
     tbl = schema.get_table(target_table)
     prod_rows = tbl.row_count if tbl else 1000
 
+    fp = getattr(adapter, "source_fingerprint", "default") if hasattr(adapter, "source_fingerprint") else "default"
+    traps_enabled = getattr(adapter, "inject_traps", True) if hasattr(adapter, "inject_traps") else True
+    profiles: dict[str, Any] = get_cached_profile(fp, traps_enabled) or {}
+
     # Phase 1: Planning (derive spec if not provided, or validate supplied spec)
     if spec is not None:
         val_errors = validate_spec_against_schema(spec, schema, target_table)
@@ -251,14 +478,16 @@ def run_time_machine_agent(
             )
     else:
         notify(f"Generating MigrationSpec using {fast_model}...")
-        clone = adapter.clone()
-        try:
-            profiles = profile_database(clone, schema)
-        except Exception as exc:
-            logger.debug(f"Could not compute database profile: {exc}")
-            profiles = {}
-        finally:
-            clone.close()
+        if not profiles:
+            clone = adapter.clone()
+            try:
+                profiles = profile_database(clone, schema)
+                set_cached_profile(fp, traps_enabled, profiles)
+            except Exception as exc:
+                logger.debug(f"Could not compute database profile: {exc}")
+                profiles = {}
+            finally:
+                clone.close()
 
         spec_result = generate_spec(
             client=client,
@@ -337,7 +566,20 @@ def run_time_machine_agent(
     repeat_counts: dict[str, int] = {}
     failed_check_counts: dict[str, int] = {}
     failed_attempts_count = 0
-    messages: list[dict[str, Any]] = []
+    attempt_history = AttemptHistory()
+    step_split_rule = ""
+
+    # Put static schema, transform contract, and execution gotchas in system message once
+    system_content = (
+        "You are an expert database migration engineer writing SQLite migration SQL.\n\n"
+        f"Current Database Schema:\n{format_schema_summary(schema)}\n\n"
+        f"Approved Migration Plan (MigrationSpec):\n{spec.model_dump_json(indent=2) if spec else ''}\n\n"
+        f"{generate_transform_contract(spec) if spec else ''}\n\n"
+        f"{get_sqlite_gotchas_block()}\n\n"
+        "Format Requirement: Prefer calling the submit(up_sql, down_sql) tool with your forward and rollback migrations explicitly separated. "
+        "If returning markdown code blocks, you MUST use '-- ==== UP ====' for the forward migration and '-- ==== DOWN ====' for the rollback migration."
+    )
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system_content}]
 
     verified_sql_hash: str | None = None
     best_up_sql: str = ""
@@ -373,10 +615,20 @@ def run_time_machine_agent(
             notify(f"Re-prompting {current_model} after identical attempt detected...", {"step": step_num})
             traps = inv_result.trap_audit if inv_result else []
             sql_to_repair = best_up_sql or current_up_sql or last_tool_sql
-            base_p = build_repair_prompt(schema, spec, sql_to_repair, inv_result, trap_results=traps, max_tool_calls=max_tool_rounds)
+            base_p = build_repair_prompt(
+                schema,
+                spec,
+                sql_to_repair,
+                inv_result,
+                trap_results=traps,
+                max_tool_calls=max_tool_rounds,
+                history=attempt_history,
+                split_rule=step_split_rule,
+                down_sql=current_down_sql,
+            )
             prompt = f"Your previous reply was {repeat_feedback}.\n\n{base_p}"
             repeat_feedback = None
-            messages = [{"role": "user", "content": prompt}]
+            messages.append({"role": "user", "content": prompt})
         elif consecutive_no_sql > 0 and messages:
             notify(f"No SQL in reply, continuing same conversation (retry {consecutive_no_sql}/2)", {"step": step_num, "retry": consecutive_no_sql})
             messages.append({
@@ -388,8 +640,14 @@ def run_time_machine_agent(
             })
         elif inv_result is None:
             notify(f"Drafting initial migration using {current_model}...", {"step": step_num})
-            prompt = build_migration_prompt(schema, spec, is_naive_baseline=is_naive_baseline, max_tool_calls=max_tool_rounds)
-            messages = [{"role": "user", "content": prompt}]
+            prompt = build_migration_prompt(
+                schema,
+                spec,
+                is_naive_baseline=is_naive_baseline,
+                max_tool_calls=max_tool_rounds,
+                profiles=profiles,
+            )
+            messages.append({"role": "user", "content": prompt})
         else:
             model_label = "Ultra" if "ultra" in current_model.lower() else ("Super" if "super" in current_model.lower() else current_model.split("/")[-1])
             first_fail_str = (inv_result.failed_checks[0][:160]) if (inv_result and inv_result.failed_checks) else (inv_result.error or "verification failure")
@@ -397,8 +655,18 @@ def run_time_machine_agent(
             traps = inv_result.trap_audit if inv_result else []
             # If an attempt crashes in the sandbox, repair from the best executable SQL plus crash message
             sql_to_repair = best_up_sql if (best_up_sql and inv_result and not inv_result.passed and inv_result.error) else (current_up_sql or last_tool_sql)
-            prompt = build_repair_prompt(schema, spec, sql_to_repair, inv_result, trap_results=traps, max_tool_calls=max_tool_rounds)
-            messages = [{"role": "user", "content": prompt}]
+            prompt = build_repair_prompt(
+                schema,
+                spec,
+                sql_to_repair,
+                inv_result,
+                trap_results=traps,
+                max_tool_calls=max_tool_rounds,
+                history=attempt_history,
+                split_rule=step_split_rule,
+                down_sql=current_down_sql,
+            )
+            messages.append({"role": "user", "content": prompt})
 
         step_up_sql = ""
         step_down_sql = ""
@@ -470,10 +738,11 @@ def run_time_machine_agent(
             tool_calls = getattr(raw_msg, "tool_calls", None)
 
             if content:
-                extracted_up, extracted_down = parse_sql_scripts(content)
+                extracted_up, extracted_down, split_rule = parse_sql_scripts_ex(content)
                 if extracted_up:
                     step_up_sql = extracted_up
                     step_down_sql = extracted_down
+                    step_split_rule = split_rule
 
             if tool_calls:
                 tool_rounds += 1
@@ -584,10 +853,11 @@ def run_time_machine_agent(
                 content = raw_msg.content or ""
                 messages.append({"role": "assistant", "content": content})
                 if content:
-                    extracted_up, extracted_down = parse_sql_scripts(content)
+                    extracted_up, extracted_down, split_rule = parse_sql_scripts_ex(content)
                     if extracted_up:
                         step_up_sql = extracted_up
                         step_down_sql = extracted_down
+                        step_split_rule = split_rule
 
                 steps.append(
                     AgentStepLog(
@@ -743,11 +1013,27 @@ def run_time_machine_agent(
             run_ok, run_err, run_elapsed = adapter.run_in_sandbox(test_clone, current_up_sql, fk_enabled=True)
 
             if not run_ok:
+                err_msg = run_err or "Execution error"
+                hint = ""
+                m_nn = re.search(r"NOT NULL constraint failed:\s*([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)", err_msg)
+                if m_nn:
+                    col_name = m_nn.group(2)
+                    try:
+                        cur_b = base_clone.cursor()
+                        cur_b.execute(f'SELECT COUNT(*) FROM "{target_table}" WHERE "{col_name}" IS NULL')
+                        null_cnt = cur_b.fetchone()[0]
+                    except Exception:
+                        null_cnt = "?"
+                    mapping = next((m for m in spec.get_table_mappings(target_table) if m.new_column == col_name), None) if spec else None
+                    if mapping and mapping.default_value is not None:
+                        hint = f" [How to fix: Column '{col_name}' has {null_cnt} NULL rows in source table. Use COALESCE({col_name}, '{mapping.default_value}') to fill defaults as specified in spec.]"
+                    else:
+                        hint = f" [How to fix: Column '{col_name}' has {null_cnt} NULL rows in source table. Keep '{col_name}' nullable in the table definition or provide a safe default.]"
                 inv_result = InvariantResult(
                     status="FAILED",
                     passed=False,
-                    error=run_err,
-                    failed_checks=[run_err or "Execution error"],
+                    error=f"{err_msg}{hint}",
+                    failed_checks=[f"{err_msg}{hint}"],
                     elapsed_ms=run_elapsed,
                     before_count=real_before,
                 )
@@ -772,6 +1058,52 @@ def run_time_machine_agent(
                             )
                 except Exception as exc:
                     logger.debug(f"No trap audit available: {exc}")
+
+                # Self-undo guard: after UP runs, if target table columns == baseline columns while spec expects new columns,
+                # or UP contains statements that recreate the baseline table name from a rollback pattern
+                if not inv_result.passed and spec:
+                    cur_m = test_clone.cursor()
+                    cur_m.execute(f'PRAGMA table_info("{target_table}")')
+                    test_cols = [r[1] for r in cur_m.fetchall()]
+                    cur_b = base_clone.cursor()
+                    cur_b.execute(f'PRAGMA table_info("{target_table}")')
+                    base_cols = [r[1] for r in cur_b.fetchall()]
+
+                    spec_req_cols = spec.get_required_columns(target_table)
+                    expects_new_columns = any(c not in base_cols for c in spec_req_cols)
+                    has_rollback_rename = bool(
+                        re.search(r"(?i)\b(?:RENAME\s+TO\s+" + target_table + r")\b", current_up_sql)
+                        and ("_old" in current_up_sql or "_prev" in current_up_sql or "_orig" in current_up_sql)
+                    )
+
+                    if (test_cols == base_cols and expects_new_columns) or (
+                        has_rollback_rename and any("MISSING_REQUIRED_COLUMNS" in fc for fc in inv_result.failed_checks)
+                    ):
+                        logger.warning("Detected self-undo pattern in up_sql! Re-splitting using last block = DOWN...")
+                        re_blocks = list(re.finditer(r"(?:^|\n)```([^\n]*)\n(.*?)\n```", content or "", re.DOTALL))
+                        if len(re_blocks) >= 2:
+                            re_up = "\n\n".join(_clean_extracted_block(m.group(2)) for m in re_blocks[:-1] if m.group(2).strip())
+                            re_down = _clean_extracted_block(re_blocks[-1].group(2))
+                            retry_clone = sqlite3.connect(":memory:", check_same_thread=False)
+                            base_snapshot.backup(retry_clone)
+                            try:
+                                re_ok, re_err, re_el = adapter.run_in_sandbox(retry_clone, re_up, fk_enabled=True)
+                                if re_ok:
+                                    re_inv = evaluate_migration_invariants(
+                                        base_clone, retry_clone, target_table=target_table, spec=spec, elapsed_ms=re_el
+                                    )
+                                    if re_inv.passed:
+                                        logger.info("Re-split with last block as DOWN succeeded and passed verification!")
+                                        current_up_sql = re_up
+                                        current_down_sql = re_down
+                                        inv_result = re_inv
+                            finally:
+                                retry_clone.close()
+
+                        if not inv_result.passed:
+                            inv_result.failed_checks.insert(
+                                0, "UP_UNDONE: your up_sql contains a rollback section; keep UP and DOWN separate"
+                            )
         finally:
             base_clone.close()
             test_clone.close()
@@ -781,6 +1113,15 @@ def run_time_machine_agent(
         notify(
             f"Verification outcome: {inv_result.status} (passed {len(inv_result.passed_checks)}, failed {len(inv_result.failed_checks)}){fail_suffix}",
             {"status": inv_result.status, "inv_result": inv_result.model_dump()},
+        )
+
+        attempt_history.record_attempt(
+            attempt_num=attempt_num,
+            model=current_model,
+            up_sql=current_up_sql,
+            inv_result=inv_result,
+            down_sql=current_down_sql,
+            split_rule=step_split_rule,
         )
 
         attempts.append(
@@ -798,8 +1139,12 @@ def run_time_machine_agent(
                 down_sql=current_down_sql,
                 tool_rounds_used=tool_rounds,
                 no_sql_replies=no_sql_replies_count,
+                split_rule=step_split_rule,
             )
         )
+
+        if not any(m.get("role") == "assistant" and (m.get("content") or m.get("tool_calls")) for m in messages[-2:]):
+            messages.append({"role": "assistant", "content": content or f"```sql\n{current_up_sql}\n```"})
 
         # Best-attempt tracking: fewest failed checks (ties: most passed checks)
         failed_count = len(inv_result.failed_checks)
@@ -959,7 +1304,7 @@ Task: Provide ONLY the corrected DOWN migration inside a ```sql block to restore
     stop_reason = (
         "SUCCESS: All verification invariants passed."
         if final_status in ("VERIFIED", "UNVERIFIED")
-        else "STEP_BUDGET_EXHAUSTED"
+        else f"MAX_ATTEMPTS_EXHAUSTED (attempts used {attempts}/{max_attempts})"
     )
 
     total_lat = (time.time() - start_time) * 1000

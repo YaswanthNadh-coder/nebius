@@ -148,10 +148,61 @@ def normalize_plan_dict(plan_dict: dict[str, Any], target_table: str = "employee
     return plan_dict
 
 
+def auto_fix_spec_null_policies(spec: MigrationSpec, schema: DatabaseSchema) -> None:
+    """Auto-fix null_policy on mappings where appropriate.
+
+    - A passthrough/unchanged mapping on a source column that is nullable
+      must get null_policy="nullable" (auto-fix and log), unless the transform
+      supplies a default (default_if_null, split_name_last default, cast_int default).
+    - An INTEGER PRIMARY KEY column never requires NOT NULL (SQLite ROWID alias).
+    """
+    for tbl_name, mappings in spec.column_mappings.items():
+        tbl_info = schema.get_table(tbl_name)
+        if not tbl_info:
+            continue
+        col_by_name = {c.name.lower(): c for c in tbl_info.columns}
+        unchanged_cols = {c.lower() for c in spec.columns_declared_unchanged.get(tbl_name, [])}
+
+        for m in mappings:
+            src_col_name = (m.source_column or m.new_column).lower()
+            src_col = col_by_name.get(src_col_name)
+
+            # Never require NOT NULL for an INTEGER PRIMARY KEY
+            if src_col and src_col.pk > 0 and "INT" in src_col.type.upper():
+                if m.null_policy == "not_null":
+                    logger.info(
+                        f"Auto-fixing null_policy for INTEGER PRIMARY KEY column '{tbl_name}.{m.new_column}' to 'nullable'."
+                    )
+                    m.null_policy = "nullable"
+                continue
+
+            # Check if passthrough or declared unchanged
+            is_passthrough = (
+                m.transform in ("passthrough", "custom")
+                or m.new_column.lower() in unchanged_cols
+                or src_col_name in unchanged_cols
+            )
+
+            # Check if transform supplies a default
+            has_default = (
+                m.default_value is not None
+                or m.transform in ("default_if_null", "split_name_last", "cast_int")
+            )
+
+            if is_passthrough and src_col is not None:
+                # If source column is nullable
+                if not src_col.notnull and not has_default and m.null_policy == "not_null":
+                    logger.info(
+                        f"Auto-fixing null_policy for nullable passthrough column '{tbl_name}.{m.new_column}' to 'nullable'."
+                    )
+                    m.null_policy = "nullable"
+
+
 def validate_spec_against_schema(
     spec: MigrationSpec,
     schema: DatabaseSchema,
     target_table: str,
+    profiles: dict[str, Any] | None = None,
 ) -> list[str]:
     """Validate MigrationSpec against the actual database schema.
 
@@ -161,6 +212,7 @@ def validate_spec_against_schema(
     3. every source_column exists in the source table (or is None)
     4. lookup_table, lookup_key and lookup_val exist
     5. columns_declared_unchanged and expected_constraints reference real columns
+    6. mapping is not_null, source profile contains NULLs, and no default exists
     """
     errors: list[str] = []
 
@@ -254,6 +306,29 @@ def validate_spec_against_schema(
                         f"expected_constraints for table '{tbl_name}' references nonexistent column '{item}'"
                     )
 
+    # 6. Check NOT NULL with source profile NULLs
+    if profiles:
+        for tbl_name, mappings in spec.column_mappings.items():
+            tbl_profiles = profiles.get(tbl_name, {})
+            for m in mappings:
+                if m.null_policy == "not_null":
+                    src_col_name = m.source_column or m.new_column
+                    prof = tbl_profiles.get(src_col_name) if isinstance(tbl_profiles, dict) else None
+                    null_count = 0
+                    if prof is not None:
+                        if isinstance(prof, dict):
+                            null_count = prof.get("null_count", 0)
+                        else:
+                            null_count = getattr(prof, "null_count", 0)
+                    has_default = (
+                        m.default_value is not None
+                        or m.transform in ("default_if_null", "split_name_last", "cast_int")
+                    )
+                    if null_count > 0 and not has_default:
+                        errors.append(
+                            f"Column '{tbl_name}.{m.new_column}' is specified as NOT NULL, but source data in '{src_col_name}' contains {null_count} NULLs and no default is provided."
+                        )
+
     return errors
 
 
@@ -280,7 +355,8 @@ def generate_spec(
         plan_dict = extract_json_from_text(raw_response)
         normalized = normalize_plan_dict(plan_dict, target_table=target_table)
         candidate = MigrationSpec.model_validate(normalized)
-        val_errs = validate_spec_against_schema(candidate, schema, target_table)
+        auto_fix_spec_null_policies(candidate, schema)
+        val_errs = validate_spec_against_schema(candidate, schema, target_table, profiles=profiles)
         if val_errs:
             raise ValueError(f"Schema validation failed: {'; '.join(val_errs)}")
         spec = candidate
@@ -322,7 +398,8 @@ def generate_spec(
             plan_dict = extract_json_from_text(raw_response)
             normalized = normalize_plan_dict(plan_dict, target_table=target_table)
             candidate = MigrationSpec.model_validate(normalized)
-            val_errs = validate_spec_against_schema(candidate, schema, target_table)
+            auto_fix_spec_null_policies(candidate, schema)
+            val_errs = validate_spec_against_schema(candidate, schema, target_table, profiles=profiles)
             if val_errs:
                 raise ValueError(f"Schema validation failed after retry: {'; '.join(val_errs)}")
             spec = candidate

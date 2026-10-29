@@ -629,7 +629,7 @@ def test_tool_set_inv_result_tracks_last_tool_sql_and_preserves_draft_label():
     # Check Step 2 prompt:
     # 3rd create call was for Step 2. Its prompt messages should contain 'tool_test_col'
     step2_msgs = client.chat.completions.create.call_args_list[2][1]["messages"]
-    step2_prompt = step2_msgs[0]["content"]
+    step2_prompt = " ".join(m["content"] for m in step2_msgs if m.get("role") == "user")
     assert "tool_test_col" in step2_prompt, f"last_tool_sql not included in repair prompt: {step2_prompt}"
 
     # Verify action labels: step that produces the first migration SQL is labeled draft_migration

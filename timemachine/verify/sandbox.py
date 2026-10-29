@@ -1,5 +1,6 @@
 """Sandboxing utilities and identifier validation."""
 
+import contextlib
 import re
 import sqlite3
 import time
@@ -117,6 +118,28 @@ def make_sandbox_progress_handler(deadline_s: float = 2.0):
         return 1 if (time.monotonic() - t0) > deadline_s else 0
 
     return _tick
+
+
+@contextlib.contextmanager
+def sandbox(
+    conn: sqlite3.Connection,
+    timeout_s: float = 2.0,
+    authorizer: SandboxAuthorizer | None = None,
+):
+    """Context manager for executing SQLite queries inside an isolated sandbox with a fresh deadline.
+
+    Resets t0 on entry and clears the progress handler with conn.set_progress_handler(None, 0) on exit.
+    """
+    auth = authorizer or make_sandbox_authorizer()
+    conn.set_authorizer(auth)
+    conn.set_progress_handler(make_sandbox_progress_handler(timeout_s), 10_000)
+    try:
+        yield auth
+    finally:
+        try:
+            conn.set_progress_handler(None, 0)
+        except Exception:
+            pass
 
 
 def apply_sandbox(

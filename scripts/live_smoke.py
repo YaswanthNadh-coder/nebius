@@ -57,9 +57,13 @@ def serialize_attempts(attempts: list[Any]) -> list[dict[str, Any]]:
         {
             "attempt": getattr(a, "attempt", 0),
             "model": getattr(a, "model", ""),
+            "up_sql_preview": (getattr(a, "up_sql", "") or "")[:400],
+            "down_sql_preview": (getattr(a, "down_sql", "") or "")[:400],
+            "split_rule": getattr(a, "split_rule", "") or "unknown",
             "passed_count": getattr(a, "passed_count", 0),
             "failed_count": getattr(a, "failed_count", 0),
             "first_failed_check": getattr(a, "first_failed_check", ""),
+            "failed_checks": [getattr(a, "first_failed_check", "")] if getattr(a, "first_failed_check", "") else [],
             "sandbox_error": getattr(a, "sandbox_error", None),
             "latency_ms": getattr(a, "latency_ms", 0.0),
             "tokens": getattr(a, "tokens", 0),
@@ -69,6 +73,27 @@ def serialize_attempts(attempts: list[Any]) -> list[dict[str, Any]]:
         }
         for a in attempts
     ]
+
+
+def assert_no_up_contains_down(attempts: list[Any], run_label: str = "run") -> None:
+    """Fail live smoke execution if any attempt's UP migration contains the DOWN script."""
+    import re
+    for a in attempts:
+        up = getattr(a, "up_sql", "") or ""
+        down = getattr(a, "down_sql", "") or ""
+        att = getattr(a, "attempt", 0)
+        if not up or not down:
+            continue
+        cleaned_down = re.sub(r"--.*$", "", down, flags=re.MULTILINE).strip()
+        cleaned_up = re.sub(r"--.*$", "", up, flags=re.MULTILINE).strip()
+        if len(cleaned_down) > 40 and cleaned_down in cleaned_up:
+            raise AssertionError(
+                f"[{run_label}] Attempt #{att}: up_sql contains down_sql! Splitter failed to separate UP and DOWN."
+            )
+        if re.search(r"--\s*[-=*~_# ]*(?:down|rollback|revert|undo|reverse|backward|migrate\s+down)\b", up, re.IGNORECASE):
+            raise AssertionError(
+                f"[{run_label}] Attempt #{att}: up_sql contains an un-split DOWN marker line!"
+            )
 
 
 def benchmark_performance(row_counts: list[int] | None = None) -> dict[str, Any]:
@@ -298,6 +323,7 @@ def main():
                 is_naive_baseline=False,
             )
             std_behavior = inspect_model_behavior(std_res)
+            assert_no_up_contains_down(std_res.attempts, f"{sc_name} standard")
 
             print(f"  Status:                  {std_res.status}")
             print(f"  Stop Reason:             {std_res.stop_reason}")
@@ -342,6 +368,7 @@ def main():
                 is_naive_baseline=True,
             )
             naive_behavior = inspect_model_behavior(naive_res)
+            assert_no_up_contains_down(naive_res.attempts, f"{sc_name} naive")
 
             print(f"  Status:                  {naive_res.status}")
             print(f"  Stop Reason:             {naive_res.stop_reason}")

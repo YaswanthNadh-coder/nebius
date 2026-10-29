@@ -134,7 +134,10 @@ class ToolExecutor:
     def execute(self, name: str, arguments_json: str) -> dict[str, Any]:
         """Dispatch tool call by name."""
         try:
-            args = json.loads(arguments_json) if arguments_json else {}
+            if isinstance(arguments_json, dict):
+                args = arguments_json
+            else:
+                args = json.loads(arguments_json) if arguments_json else {}
         except Exception as exc:
             return {"error": f"Invalid arguments JSON: {exc}"}
 
@@ -201,6 +204,14 @@ class ToolExecutor:
                 up_sql = args.get("up_sql", "")
                 if not up_sql or not up_sql.strip():
                     return {"error": "up_sql must not be empty."}
+
+                # Strip any DOWN section inadvertently passed inside up_sql
+                from timemachine.agent.loop import parse_sql_scripts_ex
+                p_up, p_down, _ = parse_sql_scripts_ex(up_sql)
+                if p_down:
+                    up_sql = p_up
+                    if not args.get("down_sql"):
+                        args["down_sql"] = p_down
 
                 import re
 
@@ -302,10 +313,19 @@ class ToolExecutor:
                     clone.close()
 
             if name == "submit":
+                from timemachine.agent.loop import parse_sql_scripts_ex
+                raw_up = args.get("up_sql", "")
+                raw_down = args.get("down_sql", "")
+                if raw_up:
+                    p_up, p_down, _ = parse_sql_scripts_ex(raw_up)
+                    if p_down:
+                        raw_up = p_up
+                        if not raw_down:
+                            raw_down = p_down
                 return {
                     "status": "submitted",
-                    "up_sql": args.get("up_sql", ""),
-                    "down_sql": args.get("down_sql", ""),
+                    "up_sql": raw_up,
+                    "down_sql": raw_down,
                     "notes": args.get("notes", ""),
                 }
 
