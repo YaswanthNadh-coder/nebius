@@ -4,7 +4,12 @@ import sqlite3
 from typing import Any
 
 from timemachine.logging import get_logger
-from timemachine.verify.sandbox import apply_sandbox
+from timemachine.verify.sandbox import (
+    apply_sandbox,
+    calc_sandbox_timeout,
+    make_sandbox_progress_handler,
+    quote_ident,
+)
 
 logger = get_logger("verify.rebuild")
 
@@ -65,23 +70,27 @@ def verify_rollback_roundtrip(
     down_sql: str,
     target_table: str,
     fk_enabled: bool = True,
+    base_timeout_s: float = 2.0,
 ) -> RollbackVerificationResult:
     """Verify that applying up_sql then down_sql returns the database to its exact baseline state.
 
-    Compares per row by primary key and per column by name (never by position or str(rows)).
+    Compares per row by primary key (or composite PK / rowid) and per column by name.
     Classifies result as: EXACT, EQUIVALENT_AFTER_NORMALIZATION, LOSSY, or BROKEN.
     """
+    try:
+        base_conn.commit()
+    except Exception:
+        pass
+
     clone = sqlite3.connect(":memory:", check_same_thread=False)
     base_conn.backup(clone)
-    apply_sandbox(clone)
     cur = clone.cursor()
 
-    # Enforce same foreign keys setting as UP verification
-    cur.execute(f"PRAGMA foreign_keys = {'ON' if fk_enabled else 'OFF'};")
+    safe_table = quote_ident(target_table)
 
     # Read baseline table structure and rows
     b_cur = base_conn.cursor()
-    b_cur.execute(f'PRAGMA table_info("{target_table}")')
+    b_cur.execute(f"PRAGMA table_info({safe_table})")
     b_col_info = b_cur.fetchall()
     if not b_col_info:
         clone.close()
@@ -94,25 +103,62 @@ def verify_rollback_roundtrip(
 
     b_cols = [r[1] for r in b_col_info]
     pk_cols = [r[1] for r in b_col_info if r[5] > 0]
-    pk_col_expr = ", ".join(f'"{c}"' for c in pk_cols) if pk_cols else "rowid"
+    quoted_cols = ", ".join(quote_ident(c) for c in b_cols)
 
-    b_cur.execute(f'SELECT {pk_col_expr} AS __pk__, * FROM "{target_table}"')
-    b_rows = b_cur.fetchall()
-    orig_rows_by_pk: dict[str, dict[str, Any]] = {}
-    for r in b_rows:
-        row_dict = {col: r[i + 1] for i, col in enumerate(b_cols)}
-        pk_val = str(r[0])
-        orig_rows_by_pk[pk_val] = row_dict
+    orig_rows_by_pk: dict[Any, dict[str, Any]] = {}
+    if not pk_cols:
+        b_cur.execute(f"SELECT rowid, {quoted_cols} FROM {safe_table}")
+        b_rows = b_cur.fetchall()
+        for r in b_rows:
+            pk_val = str(r[0])
+            orig_rows_by_pk[pk_val] = {col: r[i + 1] for i, col in enumerate(b_cols)}
+    else:
+        b_cur.execute(f"SELECT {quoted_cols} FROM {safe_table}")
+        b_rows = b_cur.fetchall()
+        for r in b_rows:
+            row_dict = {col: r[i] for i, col in enumerate(b_cols)}
+            pk_val = tuple(row_dict[c] for c in pk_cols) if len(pk_cols) > 1 else str(row_dict[pk_cols[0]])
+            orig_rows_by_pk[pk_val] = row_dict
+
+    total_rows = len(orig_rows_by_pk)
+    try:
+        timeout_s = float(base_timeout_s) if isinstance(base_timeout_s, (int, float)) else 2.0
+    except (TypeError, ValueError):
+        timeout_s = 2.0
+    scaled_timeout = calc_sandbox_timeout(total_rows, base_timeout_s=timeout_s)
+    apply_sandbox(clone, deadline_s=scaled_timeout)
+
+    # Enforce foreign keys setting
+    cur.execute(f"PRAGMA foreign_keys = {'ON' if fk_enabled else 'OFF'};")
 
     try:
         # Step 1: Apply UP migration
         clone.executescript(up_sql)
+    except Exception as exc:
+        msg = str(exc)
+        if "interrupted" in msg.lower():
+            err_msg = f"TIMEOUT after {scaled_timeout:.1f}s during forward migration execution in roundtrip."
+        elif "not authorized" in msg.lower() or "authorization denied" in msg.lower():
+            err_msg = f"SANDBOX VIOLATION during forward migration in roundtrip: {exc}"
+        else:
+            err_msg = f"FORWARD_MIGRATION_EXECUTION_ERROR in UP script: {exc}"
+        clone.close()
+        return RollbackVerificationResult(
+            classification="BROKEN",
+            lossy_columns=[],
+            sample_diffs=[],
+            error=err_msg,
+        )
+
+    try:
+        # Refresh timeout handler for DOWN migration
+        clone.set_progress_handler(make_sandbox_progress_handler(scaled_timeout), 10_000)
 
         # Step 2: Apply DOWN migration
         clone.executescript(down_sql)
 
         # Step 3: Check restored table schema
-        cur.execute(f'PRAGMA table_info("{target_table}")')
+        cur.execute(f"PRAGMA table_info({safe_table})")
         down_col_info = cur.fetchall()
         if not down_col_info:
             return RollbackVerificationResult(
@@ -132,14 +178,21 @@ def verify_rollback_roundtrip(
                 error=f"Rollback dropped columns: {', '.join(missing_cols)}",
             )
 
-        # Step 4: Query restored rows
-        cur.execute(f'SELECT {pk_col_expr} AS __pk__, * FROM "{target_table}"')
-        down_rows = cur.fetchall()
-        restored_rows_by_pk: dict[str, dict[str, Any]] = {}
-        for r in down_rows:
-            row_dict = {col: r[i + 1] for i, col in enumerate(down_cols)}
-            pk_val = str(r[0])
-            restored_rows_by_pk[pk_val] = row_dict
+        # Step 4: Query restored rows using exact baseline columns
+        restored_rows_by_pk: dict[Any, dict[str, Any]] = {}
+        if not pk_cols:
+            cur.execute(f"SELECT rowid, {quoted_cols} FROM {safe_table}")
+            down_rows = cur.fetchall()
+            for r in down_rows:
+                pk_val = str(r[0])
+                restored_rows_by_pk[pk_val] = {col: r[i + 1] for i, col in enumerate(b_cols)}
+        else:
+            cur.execute(f"SELECT {quoted_cols} FROM {safe_table}")
+            down_rows = cur.fetchall()
+            for r in down_rows:
+                row_dict = {col: r[i] for i, col in enumerate(b_cols)}
+                pk_val = tuple(row_dict[c] for c in pk_cols) if len(pk_cols) > 1 else str(row_dict[pk_cols[0]])
+                restored_rows_by_pk[pk_val] = row_dict
 
         if set(orig_rows_by_pk.keys()) != set(restored_rows_by_pk.keys()):
             diff_keys = set(orig_rows_by_pk.keys()) ^ set(restored_rows_by_pk.keys())
@@ -177,7 +230,7 @@ def verify_rollback_roundtrip(
                         lossy_columns.append(col)
                     if len(sample_diffs) < 3:
                         sample_diffs.append({
-                            "pk": pk_val,
+                            "pk": str(pk_val),
                             "column": col,
                             "original": orig_val,
                             "restored": rest_val,
@@ -210,11 +263,18 @@ def verify_rollback_roundtrip(
         )
 
     except Exception as exc:
+        msg = str(exc)
+        if "interrupted" in msg.lower():
+            err_msg = f"TIMEOUT after {scaled_timeout:.1f}s during rollback execution."
+        elif "not authorized" in msg.lower() or "authorization denied" in msg.lower():
+            err_msg = f"SANDBOX VIOLATION during rollback: {exc}"
+        else:
+            err_msg = f"ROLLBACK_EXECUTION_ERROR: {exc}"
         return RollbackVerificationResult(
             classification="BROKEN",
             lossy_columns=[],
             sample_diffs=[],
-            error=f"ROLLBACK_EXECUTION_ERROR: {exc}",
+            error=err_msg,
         )
     finally:
         clone.close()

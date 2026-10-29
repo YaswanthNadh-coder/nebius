@@ -5,6 +5,7 @@ import sqlite3
 from typing import Any
 
 from timemachine.adapters.base import DbAdapter
+from timemachine.agent.llm import has_ddl_or_dml
 from timemachine.agent.prompts import format_schema_summary
 from timemachine.traps.profiler import mask_value, profile_table
 from timemachine.verify.invariants import evaluate_migration_invariants
@@ -87,7 +88,7 @@ TOOL_DEFINITIONS = [
                 "type": "object",
                 "properties": {
                     "up_sql": {"type": "string", "description": "Final forward migration SQL"},
-                    "down_sql": {"type": "string", "description": "Final rollback SQL (optional)", "default": ""},
+                    "down_sql": {"type": "string", "description": "Final rollback SQL script to restore baseline state without data loss", "default": ""},
                     "notes": {"type": "string", "description": "Explanatory notes and trade-offs", "default": ""},
                 },
                 "required": ["up_sql"],
@@ -118,11 +119,17 @@ class ToolExecutor:
 
     def create_clone(self) -> Any:
         """Create disposable sandbox clone using fast in-memory backup if snapshot is available."""
+        from timemachine.verify.sandbox import apply_sandbox
+
+        timeout = getattr(self.adapter.settings, "sandbox_timeout_s", 2.0) if hasattr(self.adapter, "settings") else 2.0
         if self.base_snapshot is not None:
             c = sqlite3.connect(":memory:", check_same_thread=False)
             self.base_snapshot.backup(c)
+            apply_sandbox(c, deadline_s=timeout)
             return c
-        return self.adapter.clone()
+        c = self.adapter.clone()
+        apply_sandbox(c, deadline_s=timeout)
+        return c
 
     def execute(self, name: str, arguments_json: str) -> dict[str, Any]:
         """Dispatch tool call by name."""
@@ -256,7 +263,29 @@ class ToolExecutor:
                                 )
                     except Exception:
                         pass
-                    return inv.model_dump()
+
+                    res_dict = inv.model_dump()
+                    down_sql = args.get("down_sql", "").strip()
+                    if down_sql and has_ddl_or_dml(down_sql):
+                        from timemachine.verify.rebuild import verify_rollback_roundtrip
+                        rb_clone = self.create_clone()
+                        try:
+                            rb_res = verify_rollback_roundtrip(
+                                rb_clone,
+                                up_sql,
+                                down_sql,
+                                target_table=self.target_table,
+                                base_timeout_s=getattr(self.adapter.settings, "sandbox_timeout_s", 2.0) if hasattr(self.adapter, "settings") else 2.0,
+                            )
+                            res_dict["rollback_verified"] = rb_res.rollback_verified
+                            res_dict["rollback_classification"] = rb_res.classification
+                            if not rb_res.rollback_verified:
+                                res_dict["rollback_error"] = rb_res.error
+                                res_dict["rollback_lossy_columns"] = rb_res.lossy_columns
+                        finally:
+                            rb_clone.close()
+
+                    return res_dict
                 finally:
                     base_clone.close()
                     test_clone.close()

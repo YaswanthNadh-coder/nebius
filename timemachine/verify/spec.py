@@ -28,7 +28,7 @@ class ColumnMapping(BaseModel):
     new_column: str
     source_column: str | None = None
     transform: TransformType = "passthrough"
-    null_policy: str = "not_null"   # not_null, nullable
+    null_policy: str = "nullable"   # not_null, nullable
     default_value: Any | None = None
     lookup_table: str | None = None
     lookup_key: str | None = None

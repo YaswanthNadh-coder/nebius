@@ -144,7 +144,39 @@ def parse_sql_scripts(content: str) -> tuple[str, str]:
     """Parse UP and optional DOWN migration scripts from LLM content without guessing by position."""
     text = content.replace("\r\n", "\n")
 
-    # 1. Split on a down/rollback line (either plain comment or fence opening with down/rollback comment)
+    # 1. Check for fenced blocks first
+    fence_pattern = re.compile(
+        r"(?:^|\n)```([^\n]*)\n(.*?)\n```",
+        re.DOTALL,
+    )
+    matches = list(fence_pattern.finditer(text))
+    if matches:
+        down_start_idx = None
+        for i, m in enumerate(matches):
+            tag = m.group(1).lower()
+            block_body = m.group(2).strip().lower()
+            if "down" in tag or "rollback" in tag:
+                down_start_idx = i
+                break
+            if block_body.startswith(("-- down", "--down", "-- rollback", "--rollback")):
+                down_start_idx = i
+                break
+            prev_end = matches[i - 1].end() if i > 0 else 0
+            prose = text[prev_end:m.start()].strip()
+            if re.search(r"(?im)\b(?:down|rollback)\b", prose):
+                down_start_idx = i
+                break
+
+        if down_start_idx is not None and down_start_idx > 0:
+            up_blocks = [_clean_extracted_block(matches[j].group(2)) for j in range(down_start_idx) if matches[j].group(2).strip()]
+            down_blocks = [_clean_extracted_block(matches[j].group(2)) for j in range(down_start_idx, len(matches)) if matches[j].group(2).strip()]
+            up = "\n\n".join(b for b in up_blocks if b)
+            down = "\n\n".join(b for b in down_blocks if b)
+            if not has_ddl_or_dml(down):
+                down = ""
+            return up, down
+
+    # 2. Split on a down/rollback line (either plain comment or fence opening with down/rollback comment)
     down_line_re = re.compile(r"(?im)^\s*(?:```[a-zA-Z0-9_-]*\s*)?--\s*(?:DOWN|ROLLBACK)\b.*$")
     match = down_line_re.search(text)
     if match:
@@ -156,35 +188,7 @@ def parse_sql_scripts(content: str) -> tuple[str, str]:
             down = ""
         return up, down
 
-    # 2. Check for fenced blocks with down/rollback fence tags or preceding prose labelled down/rollback
-    fence_pattern = re.compile(
-        r"(?:^|\n)```([^\n]*)\n(.*?)\n```",
-        re.DOTALL,
-    )
-    matches = list(fence_pattern.finditer(text))
     if matches:
-        down_start_idx = None
-        for i, m in enumerate(matches):
-            tag = m.group(1).lower()
-            if "down" in tag or "rollback" in tag:
-                down_start_idx = i
-                break
-            prev_end = matches[i - 1].end() if i > 0 else 0
-            prose = text[prev_end:m.start()].strip()
-            if re.search(r"(?im)^\s*(?:down|rollback|down\s+migration|rollback\s+script):?\s*$", prose):
-                down_start_idx = i
-                break
-
-        if down_start_idx is not None:
-            up_blocks = [_clean_extracted_block(matches[j].group(2)) for j in range(down_start_idx) if matches[j].group(2).strip()]
-            down_blocks = [_clean_extracted_block(matches[j].group(2)) for j in range(down_start_idx, len(matches)) if matches[j].group(2).strip()]
-            up = "\n\n".join(b for b in up_blocks if b)
-            down = "\n\n".join(b for b in down_blocks if b)
-            if not has_ddl_or_dml(down):
-                down = ""
-            return up, down
-
-        # Otherwise treat ALL fenced blocks as UP (concatenate in order) and down = ""
         all_blocks = [_clean_extracted_block(m.group(2)) for m in matches if m.group(2).strip()]
         up = "\n\n".join(b for b in all_blocks if b)
         return up, ""
@@ -198,7 +202,7 @@ def run_time_machine_agent(
     spec: MigrationSpec | None = None,
     target_table: str = "employees",
     api_key_override: str | None = None,
-    max_steps: int = 8,
+    max_steps: int | None = None,
     is_naive_baseline: bool = False,
     progress_callback: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> AgentRunResult:
@@ -832,7 +836,8 @@ def run_time_machine_agent(
 
     # Phase 3: Rollback Verification & Roundtrip Test
     # If verification passed, use verified SQL; if not, return the best attempt
-    if inv_result and inv_result.passed and inv_result.status in ("VERIFIED", "UNVERIFIED"):
+    is_forward_verified = bool(inv_result and inv_result.passed and inv_result.status in ("VERIFIED", "UNVERIFIED"))
+    if is_forward_verified:
         final_up = current_up_sql
         final_down = current_down_sql
     else:
@@ -845,7 +850,7 @@ def run_time_machine_agent(
     rollback_err: str | None = None
     lossy_cols: list[str] = []
     rb_res = None
-    if final_up and final_down:
+    if is_forward_verified and final_up and final_down:
         notify("Verifying rollback roundtrip on disposable clone...")
         base_clone = sqlite3.connect(":memory:", check_same_thread=False)
         base_snapshot.backup(base_clone)
@@ -856,16 +861,22 @@ def run_time_machine_agent(
                 final_down,
                 target_table=target_table,
                 fk_enabled=True,
+                base_timeout_s=settings.sandbox_timeout_s,
             )
             rollback_ok = rb_res.rollback_verified
             rollback_err = rb_res.error
             lossy_cols = rb_res.lossy_columns
 
-            # If rollback is BROKEN, run extra repair step for DOWN script only (stop after 2 tries)
+            # If rollback is not verified (BROKEN or LOSSY), run repair step for DOWN script,
+            # but only if the error was not a failure inside the UP migration
+            is_forward_crash = bool(rb_res.error and "FORWARD_MIGRATION" in rb_res.error)
             rb_tries = 0
-            while rb_res.classification == "BROKEN" and rb_tries < 2:
+            while (not rollback_ok) and (not is_forward_crash) and rb_tries < 2:
+                remaining_budget = max(0.0, wall_clock_budget - (time.time() - start_time))
+                if remaining_budget < 10.0:
+                    break
                 rb_tries += 1
-                notify(f"Rollback roundtrip BROKEN: repairing DOWN script (attempt {rb_tries}/2)...")
+                notify(f"Rollback roundtrip {rb_res.classification}: repairing DOWN script (attempt {rb_tries}/2)...")
                 diffs_text = (
                     "; ".join([f"PK {d['pk']} col {d['column']}: expected {d['original']!r}, got {d['restored']!r}" for d in rb_res.sample_diffs])
                     if rb_res.sample_diffs
@@ -885,13 +896,14 @@ Sample diffs: {diffs_text}
 Task: Provide ONLY the corrected DOWN migration inside a ```sql block to restore table '{target_table}' to its original baseline state."""
 
                 try:
+                    call_to = min(settings.llm_timeout_s, 30.0, max(2.0, remaining_budget))
                     raw_msg, _ = call_llm(
                         client,
                         ultra_model,
                         messages=[{"role": "user", "content": down_repair_prompt}],
                         temperature=0.1,
                         tools=None,
-                        timeout=min(settings.llm_timeout_s, 30.0),
+                        timeout=call_to,
                     )
                     content = raw_msg.content or ""
                     _, new_down = parse_sql_scripts(content)
@@ -905,6 +917,7 @@ Task: Provide ONLY the corrected DOWN migration inside a ```sql block to restore
                             final_down,
                             target_table=target_table,
                             fk_enabled=True,
+                            base_timeout_s=settings.sandbox_timeout_s,
                         )
                         rollback_ok = rb_res.rollback_verified
                         rollback_err = rb_res.error
@@ -918,13 +931,15 @@ Task: Provide ONLY the corrected DOWN migration inside a ```sql block to restore
         finally:
             base_clone.close()
 
-        if not rollback_ok:
+        if not rollback_ok and rb_res:
             if rb_res.classification == "LOSSY":
                 notify(f"Rollback warning (LOSSY): {rollback_err}", {"lossy_columns": lossy_cols, "sample_diffs": rb_res.sample_diffs})
             else:
                 notify(f"Rollback error ({rb_res.classification}): {rollback_err}", {"lossy_columns": lossy_cols})
-    elif final_up:
-        rollback_err = "no valid rollback script"
+    elif not is_forward_verified:
+        rollback_err = "Forward migration did not pass dry-run verification; rollback verification skipped."
+    elif not final_down:
+        rollback_err = "no valid rollback script provided"
 
     # Estimate lock time
     lock_est = estimate_production_lock_time(

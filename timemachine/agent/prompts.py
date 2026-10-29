@@ -86,6 +86,11 @@ def get_sqlite_gotchas_block() -> str:
     """Generate concise SQLite gotchas block."""
     permitted = ", ".join(sorted(ALLOWED_PRAGMAS))
     return f"""SQLite Gotchas & Execution Rules:
+- In 12-step table rebuilds, always execute 'PRAGMA foreign_keys = OFF;' before 'BEGIN TRANSACTION;', and 'PRAGMA foreign_key_check;' before 'COMMIT;'.
+- In 'CREATE TABLE target_new (...)', preserve the EXACT column nullability and defaults from the original schema for all untouched columns (e.g. if salary was nullable in the original schema, it MUST remain nullable; do NOT add NOT NULL to columns that were not originally NOT NULL).
+- In 'INSERT INTO target_new (...) SELECT ... FROM target', explicitly list ALL columns in both INSERT and SELECT clauses (including untouched columns like id, salary, created_at). Never omit untouched columns or SQLite will fail NOT NULL constraints.
+- If creating a FOREIGN KEY reference to a parent table (e.g. departments), ensure any orphan foreign keys (values present in child but missing from parent, like 'LEGACY_99') are inserted into the parent table first (e.g. 'INSERT OR IGNORE INTO parent_table (dept_code, dept_name) VALUES (...);') or mapped to NULL, otherwise PRAGMA foreign_key_check will fail with a foreign key constraint violation.
+- Preserve the exact constraints (PRIMARY KEY, NOT NULL, DEFAULT) for all untouched columns from the original table schema.
 - TRIM(x) only removes standard spaces; to strip tabs, newlines, and carriage returns, use: TRIM(x, ' ' || char(9) || char(10) || char(13))
 - INSTR(string, substring) returns 0 when substring is not found (1-indexed).
 - Concatenating with NULL produces NULL (e.g. 'a' || NULL is NULL); use COALESCE(col, '').
@@ -133,11 +138,39 @@ def build_dynamic_task_checklist(result: InvariantResult | None) -> list[str]:
             f"Fix sandbox violation: avoid ATTACH, DETACH, VACUUM, and load_extension. Only the following permitted PRAGMAs may be used: {permitted}."
         )
 
-    # 6. Constraint Violations
-    if "NOT NULL" in failed_text or "CONSTRAINT" in failed_text or "CHECK" in failed_text:
-        checklist.append("Fix constraint violations: ensure columns with NOT NULL constraints have valid values or DEFAULT fallbacks.")
+    # 6. Foreign Key Failures
+    if "FOREIGN KEY" in failed_text or "FOREIGN_KEY" in failed_text:
+        checklist.append(
+            "Fix foreign key failure: execute 'PRAGMA foreign_keys = OFF;' at the start of your script before 'BEGIN TRANSACTION;'. If adding foreign keys, ensure orphan records (keys not in parent table) are safely mapped or defaulted before 'PRAGMA foreign_key_check;'."
+        )
 
-    # 7. General baseline requirement
+    # 7. Untouched Columns Mutation
+    if "UNTOUCHED_COLUMN_MUTATED" in failed_text or "UNTOUCHED" in failed_text:
+        checklist.append(
+            "Fix untouched column mutation: do not alter, transform, or compute values for columns declared unchanged. Copy their original values directly without modification."
+        )
+
+    # 8. Schema Constraint Violations
+    if "SCHEMA_CONSTRAINT_VIOLATION" in failed_text:
+        checklist.append(
+            "Fix schema constraint violation: check the specific column mentioned in the error. Preserve the exact column type, NULL/NOT NULL constraint, and PRIMARY KEY definitions from the original table for all preserved columns. If a column was nullable originally, define it as nullable."
+        )
+
+    # 9. NOT NULL or General Constraint Violations
+    if "NOT NULL" in failed_text or "CONSTRAINT" in failed_text or "CHECK" in failed_text:
+        import re
+        nn_match = re.search(r"NOT NULL constraint failed:\s*([\w\.]+)", " ".join(result.failed_checks))
+        col_name = nn_match.group(1) if nn_match else None
+        if col_name:
+            checklist.append(
+                f"Fix NOT NULL constraint failure on '{col_name}': explicitly include '{col_name}' in BOTH the 'INSERT INTO target_new (..., {col_name}, ...)' column list and the 'SELECT ..., {col_name}, ... FROM target' data copy query. Check the original schema: if '{col_name}' was nullable originally, ensure it is nullable in target_new."
+            )
+        else:
+            checklist.append(
+                "Fix constraint violations: ensure all columns defined with NOT NULL constraints are explicitly included in the INSERT INTO column list and populated from the original table with non-null values or safe DEFAULT fallbacks."
+            )
+
+    # 10. General baseline requirement
     if not checklist:
         checklist.append("Fix the execution error or constraint violation reported in the failure telemetry.")
 
@@ -170,7 +203,9 @@ def build_migration_prompt(
             "2. Preserve all data records without silent drops.\n"
             "3. Output BOTH ```sql -- UP MIGRATION ``` and ```sql -- DOWN MIGRATION (ROLLBACK) ```.\n"
             f"4. The schema is already above; do not call get_schema. You have at most {max_tool_calls} tool calls; finish with submit.\n"
-            "5. When complete, call the submit tool or provide the migration scripts inside ```sql blocks."
+            "5. In the new table definition, preserve the EXACT column nullability and defaults from the original schema for all untouched columns (e.g. if salary was nullable originally, keep it nullable; do NOT add NOT NULL).\n"
+            "6. In the INSERT INTO target_new (...) SELECT ... FROM target statement, explicitly list every column name in both the INSERT and SELECT clauses.\n"
+            "7. When complete, call the submit tool or provide the migration scripts inside ```sql blocks."
         )
 
     contract_section = f"\n{contract_text}\n" if contract_text else ""

@@ -572,9 +572,25 @@ def render_result_tab():
     with c2:
         st.metric("Migrated Rows", inv.after_count if inv and inv.after_count is not None else "n/a")
     with c3:
-        st.metric("Rollback Status", "✅ Verified" if res.rollback_verified else "❌ Failed")
+        if res.rollback_verified:
+            rb_label = "✅ Verified"
+        elif res.status == "FAILED":
+            rb_label = "Skipped"
+        elif res.rollback_classification == "LOSSY":
+            rb_label = "⚠️ Lossy"
+        elif res.rollback_error:
+            rb_label = "❌ Failed"
+        else:
+            rb_label = "Not Verified"
+        st.metric("Rollback Status", rb_label)
     with c4:
         st.metric("Est. Lock Duration", f"{res.lock_estimate.get('estimated_lock_sec', 0.0)}s")
+
+    if res.status != "FAILED" and not res.rollback_verified and res.rollback_error:
+        if res.rollback_classification == "LOSSY":
+            st.warning(f"⚠️ **Rollback Roundtrip Warning (LOSSY):** {res.rollback_error}")
+        else:
+            st.warning(f"ℹ️ **Rollback Roundtrip Notice ({res.rollback_classification or 'NOT_VERIFIED'}):** {res.rollback_error}")
 
     # Attempts Table
     if getattr(res, "attempts", None):
@@ -601,6 +617,10 @@ def render_result_tab():
     st.code(wrapped_up, language="sql")
 
     st.subheader("Rollback Script (`down.sql`)")
+    if res.rollback_verified:
+        st.caption("✅ Roundtrip verified on disposable clone (zero data loss).")
+    elif res.rollback_error:
+        st.caption(f"⚠️ Verification notice: {res.rollback_error}")
     st.code(res.down_sql or "-- No rollback script provided", language="sql")
 
     # Full Markdown Report

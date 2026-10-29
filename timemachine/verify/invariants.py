@@ -162,7 +162,9 @@ def evaluate_migration_invariants(
 
     # NOT NULL constraint declaration in table schema
     for col in target_nn_cols:
-        if col in col_meta and not col_meta[col]["notnull"]:
+        # In SQLite, INTEGER PRIMARY KEY columns are naturally non-null (rowid aliases)
+        # even though PRAGMA table_info reports notnull=0.
+        if col in col_meta and not col_meta[col]["notnull"] and not col_meta[col]["pk"]:
             failed_checks.append(f"SCHEMA_CONSTRAINT_VIOLATION: Column '{col}' is not defined as NOT NULL.")
         else:
             passed_checks.append(f"NOT_NULL_DECLARED_{col}")

@@ -59,6 +59,17 @@ The reference oracle normalizes string fields using Python str.strip() (strippin
 Target JSON Schema:
 {json_schema_str}
 
+Rules for MigrationSpec formulation:
+1. Column Mappings:
+   - Only include new, renamed, or transformed columns in `column_mappings`.
+   - Untouched / preserved columns (e.g. unchanged primary keys, dates, numbers) must be listed under `columns_declared_unchanged`.
+   - Valid transform types: 'passthrough', 'split_name_first', 'split_name_last', 'strip_honorific', 'cast_int', 'cast_cents', 'default_if_null', 'map_via_lookup', 'normalize_date', 'salary_band', 'trim', 'lower', 'upper'.
+2. Null Policy:
+   - Set null_policy to 'not_null' ONLY for columns that are NOT NULL in the baseline schema or explicitly required to be non-nullable by the migration goal (such as split first_name and last_name).
+   - Columns that are nullable in the source schema (e.g. department, salary, created_at) MUST have null_policy set to 'nullable'.
+3. Constraints:
+   - Only include foreign key constraints in `expected_constraints` if the migration goal explicitly requires adding foreign key constraints or if the baseline schema already contained them.
+
 Output ONLY the MigrationSpec JSON object inside a ```json ``` block."""
 
 
@@ -122,6 +133,9 @@ def normalize_plan_dict(plan_dict: dict[str, Any], target_table: str = "employee
                         trans = m.get("transform")
                         if trans not in valid_transforms:
                             m["transform"] = "custom"
+                        np = str(m.get("null_policy", "")).lower()
+                        if np not in ("not_null", "nullable"):
+                            m["null_policy"] = "nullable"
 
     # 3. Coerce risky_operations items to str
     risky = plan_dict.get("risky_operations")

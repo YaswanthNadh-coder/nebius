@@ -69,7 +69,7 @@ def _run_mutation(base_conn, sql, spec=None, target_table="employees", expected_
         expected_row_fn=expected_row_fn,
         elapsed_ms=elapsed,
     )
-    return inv.passed, (inv.failed_checks[0] if inv.failed_checks else None)
+    return inv.passed, ("; ".join(inv.failed_checks) if inv.failed_checks else None)
 
 
 # 1. Garbage constants: setting every row to 'x'/'y'/'UNASSIGNED'/0
