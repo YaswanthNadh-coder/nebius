@@ -2,11 +2,13 @@
 
 > **Autonomous Tool-Using Coding Agent for Safe Database Schema Migrations**  
 > Built for the **Nebius x NVIDIA Global AI Hackathon (Coding and Agentic Engineering Track)**.  
-> Powered by **NVIDIA Nemotron-3 Super** & **Nemotron-3 Ultra** on **Nebius Token Factory**.
+> Powered by **NVIDIA Nemotron-3 Super** (120B) & **Nemotron-3 Ultra** (550B) on **Nebius Token Factory**.
 
 [![CI](https://github.com/YaswanthNadh-coder/nebius/actions/workflows/ci.yml/badge.svg)](https://github.com/YaswanthNadh-coder/nebius/actions)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![Tests: 185 passed](https://img.shields.io/badge/tests-185%20passed-brightgreen.svg)](https://github.com/YaswanthNadh-coder/nebius)
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
+[![Docker](https://img.shields.io/badge/docker-ready-blue.svg)](https://www.docker.com/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ---
@@ -14,10 +16,12 @@
 ## 🎯 The Problem
 
 Running database migrations in production is terrifying. A single naive `INNER JOIN` against legacy unmapped records or unhandled `NULL` foreign keys silently drops customer records forever. Hand-writing rollback scripts or testing migrations against staging databases with sanitized, toy data regularly fails to catch dirty production edge cases:
-- Hidden single-word mononyms (`"Madonna"`, `"Prince"`) breaking naive string splitters.
-- Unhandled currency strings (`"$85,000"`, `"-$500"`) corrupting numeric casts.
-- Orphan foreign keys causing silent data loss under `INNER JOIN`.
-- Dropped views, triggers, and secondary indexes when recreating SQLite tables without the documented 12-step procedure.
+- **Silent Row Deletions:** Naive `INNER JOIN`s on nullable or orphan foreign keys silently dropping records.
+- **Mononym & String Boundary Breaks:** Single-word names (`"Madonna"`, `"Cher"`) or leading/trailing whitespace (`"\tGrace Hopper\n"`) breaking string splitters.
+- **Foreign Key Traps:** Orphan foreign keys (`'LEGACY_99'`) causing runtime crashes when constraints are enforced.
+- **Corrupted Numeric Casts:** Currency symbols, negative numbers, and comma separators (`"$120,000"`, `"-$50"`) failing strict integer casts.
+- **Lost Schema Artifacts:** Dropped secondary indexes, triggers, and views during SQLite 12-step table rebuilds.
+- **Unverified Emergency Rollbacks:** Rollback scripts that crash or permanently lose data when executed.
 
 ---
 
@@ -68,54 +72,25 @@ The **SQL Migration Time Machine** is an autonomous, tool-using agent that conne
 
 ---
 
-## 🛡️ Verification Engine: What Is and Is NOT Verified
-
-The Time Machine enforces clear, deterministic boundaries between what is proven correct vs. what requires human review:
-
-### What IS Verified:
-1. **Deterministic Invariant Checks:**
-   - **Row Accounting:** Explicit distinction between row *loss* (e.g. naive `INNER JOIN`) and row *duplication* (e.g. bad cross joins).
-   - **Primary Key Preservation:** Exact set identity of primary keys before and after migration.
-   - **Untouched Column Checksums:** Per-row cryptographic checksum of columns declared unchanged.
-   - **Schema Constraints:** Validation of `NOT NULL`, defaults, primary keys, and types via `PRAGMA table_info`.
-   - **Database Objects Preservation:** All non-target tables, secondary indexes, triggers, and views that existed before migration must exist and be valid afterward.
-   - **Baseline-Subtracted Foreign Key Integrity:** Runs `PRAGMA foreign_key_check` and `PRAGMA integrity_check` before and after; pre-existing source violations are reported as baseline defects, not blamed on the migration.
-   - **Foreign Key Dual-Mode:** Every migration is tested under both `PRAGMA foreign_keys = ON` and `OFF`.
-   - **No Leftover Temp Tables:** Flags any leftover `_new`, `_tmp`, or staging tables.
-   - **Rollback Round-Trip:** Verifies `down.sql` by applying `up.sql` then `down.sql` on a clone and asserting table checksum identity.
-
-2. **Row-Level Reference Oracles (`VERIFIED` status):**
-   - For standard transformations (`split_name`, `strip_honorific`, `cast_int`, `cast_cents`, `default_if_null`, `map_via_lookup`, `normalize_date`, `trim`, `lower`, `upper`), an independent Python reference implementation runs alongside the SQL. Every migrated row is compared against the oracle. When invariants and oracle agree, the run is marked **`VERIFIED`**.
-
-### What is NOT Verified (`UNVERIFIED` status):
-- For complex, proprietary business transformations outside the reference library where no independent deterministic oracle is configured, the migration will be marked **`UNVERIFIED`** (provided all invariant checks pass).
-- The system will **NEVER** falsely claim "VERIFIED" for unverified custom logic. It explicitly generates an audit warning and highlights the rows requiring human sign-off.
-
----
-
-## 🔒 Security Sandbox
-
-Untrusted or LLM-generated SQL is executed strictly inside a secured SQLite environment:
-- **`set_authorizer`:** Denies `ATTACH`, `DETACH`, `VACUUM INTO`, `load_extension`, and any `PRAGMA` other than read-only schema inspection (`table_info`, `foreign_key_check`, `integrity_check`, `index_list`, `foreign_keys`).
-- **`set_progress_handler`:** Enforces a hard **2.0-second execution deadline** preventing infinite recursion, runaway Cartesian products, and locking loops.
-- **Identifier Quoting:** All table and column identifiers are validated and quoted.
-- **Privacy Masking:** Column profiler masks emails, phone numbers, and names before passing aggregate statistics to the LLM. Real data rows are never sent into prompt templates.
-
----
-
-## 🚀 Quick Start Guide
+## ⚙️ Installation & Setup Instructions
 
 ### Prerequisites
 - **Python 3.10+** (tested on Python 3.10, 3.11, 3.12, 3.13)
-- Nebius Token Factory API Key ([Nebius AI Studio](https://tokenfactory.nebius.com/))
+- **Git** installed on your system
+- A **Nebius Token Factory API Key** ([Sign up at Nebius AI Studio](https://tokenfactory.nebius.com/))
 
-### 1. Clone the Repository
+---
+
+### Method 1: Local Python Environment Setup
+
+#### 1. Clone the Repository
 ```bash
 git clone https://github.com/YaswanthNadh-coder/nebius.git
 cd nebius
 ```
 
-### 2. Create and Activate Virtual Environment
+#### 2. Create and Activate a Virtual Environment
+
 **macOS / Linux:**
 ```bash
 python3 -m venv venv
@@ -128,147 +103,242 @@ python -m venv venv
 .\venv\Scripts\Activate.ps1
 ```
 
-### 3. Install Dependencies
+**Windows (Command Prompt):**
+```cmd
+python -m venv venv
+venv\Scripts\activate.bat
+```
+
+#### 3. Install Dependencies
 ```bash
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 4. Configure Your Nebius API Key
-Create a `.env` file in the project root (or copy `.env.example`):
+#### 4. Configure Your Nebius API Key
+Create a `.env` file in the project root:
 ```bash
 cp .env.example .env
 ```
-In `.env`, set your key:
+Open `.env` and add your Nebius API Key:
 ```env
-NEBIUS_API_KEY=your_nebius_api_key_here
+NEBIUS_API_KEY=your_actual_nebius_api_key_here
 ```
-> **Robust Key Loading:** The application automatically handles UTF-8 BOM (`\ufeff`), UTF-16, surrounding whitespace, and quotes. You can also provide or override the key directly in the Streamlit sidebar.
->
-> ⚠️ **Security Note:** Never paste API keys into public chats, issues, or pull requests, and never commit `.env` to source control. The repository `.gitignore` ensures your `.env` remains local and ignored.
 
-### 5. Launch the Streamlit Web Dashboard
+> **Note on Key Loading:** The engine automatically strips UTF-8 BOM headers (`\ufeff`), UTF-16 encoding, leading/trailing whitespace, and accidental quotes. You can also paste or override the API key directly in the web app sidebar.
+
+---
+
+### Method 2: Docker Setup
+
+If you prefer running via Docker without configuring a local Python environment:
+
+#### 1. Build the Docker Image
+```bash
+docker build -t timemachine .
+```
+
+#### 2. Run the Container
+```bash
+# Passing API key via environment variable
+docker run -p 8501:8501 -e NEBIUS_API_KEY="your_nebius_api_key_here" timemachine
+
+# Or mounting a local .env file
+docker run -p 8501:8501 -v $(pwd)/.env:/app/.env timemachine
+```
+
+Open `http://localhost:8501` in your browser.
+
+---
+
+## 🚀 Execution Instructions
+
+### 1. Launch the Web Dashboard (Streamlit)
 ```bash
 streamlit run app.py
 ```
-
-### 6. (Optional) Run CLI Smoke Test
-```bash
-python legacy/test_agent.py
-```
-> **Note:** Legacy single-file scripts (`agent.py`, `scenarios.py`, `test_agent.py`) have been moved to `legacy/`. The production system runs via `streamlit run app.py` and the `timemachine/` package.
+Open `http://localhost:8501` in your browser to access the interactive 5-tab interface.
 
 ---
 
-## 🖥️ Streamlit 5-Tab Interface
+### 2. Run Headless Migrations via CLI
 
-The web interface is organized into five persistent tabs (`st.session_state` preserved across interactions):
-
-1. **🔌 Connect:**
-   - Upload a `.sqlite`/`.db` file, provide a local path, paste a `.sql` schema dump, or pick one of the built-in realistic demo scenarios.
-   - **Upload State Persistence:** Uploaded files and schema dumps are fingerprinted `(name, size, sha256)` and loaded into memory once per file. Subsequent widget interactions and Streamlit reruns preserve your generated MigrationSpec and approval state without resetting or reloading the file.
-   - Deep schema explorer inspecting tables, columns, indexes, foreign keys, triggers, and views.
-   - Configure size caps (default 200 MB) and foreign key enforcement toggle.
-2. **📋 Plan:**
-   - Define the migration goal in natural language.
-   - Generates a structured `MigrationSpec` showing affected tables, column mappings, transforms, and null policies.
-   - Editable form requiring explicit user approval before any SQL is drafted.
-3. **⚡ Run:**
-   - Live step-by-step agent trace with `st.status`.
-   - Tool calling activity: schema introspection, table profiling, dry-run clone audits.
-   - Live before/after sample row diffs and adversarial trap results.
-4. **📊 Result:**
-   - Final certification banner (`VERIFIED`, `UNVERIFIED`, or `FAILED`).
-   - Transactional `up.sql` with safety pre-checks and reversible `down.sql`.
-   - Formatted Markdown audit report and invariant matrix.
-   - One-click downloads and exports for Plain SQL, Flyway, and Alembic.
-5. **📜 History:**
-   - Complete local SQLite run audit log (`.timemachine/runs.db`) detailing past migrations, prompt hashes, models, tokens, and timings.
-
----
-
-## 💻 Command Line Interface (CLI)
-
-The Time Machine can gate CI/CD pipelines and run headlessly:
+The Time Machine includes a command-line interface suitable for CI/CD gates and headless automation:
 
 ```bash
-# Run migration dry-run on a database file
-python -m timemachine run --db app.sqlite --goal "Split full_name into first_name and last_name" --out migrations/
+# Run migration dry-run on a local database file
+python -m timemachine run --db path/to/app.sqlite --goal "Split full_name into first_name and last_name" --out migrations/
 
-# Export as Flyway migration
+# Export as Flyway-compatible migration scripts
 python -m timemachine run --db app.sqlite --goal goal.txt --out migrations/ --format flyway
 
-# Export as Alembic migration
+# Export as an Alembic migration
 python -m timemachine run --db app.sqlite --goal goal.txt --out migrations/ --format alembic
 ```
 
-### CLI Exit Codes
-- **`0`**: **VERIFIED** — Invariants passed and oracle assertions confirmed. Safe to deploy.
-- **`1`**: **FAILED** — Constraint violation, data loss, or execution error detected.
-- **`2`**: **UNVERIFIED** — Invariant checks passed, but custom transforms require human review.
-
-### Agent Stop Reasons
-- **`SUCCESS`**: All invariant and oracle verification checks passed (`VERIFIED` or `UNVERIFIED`).
-- **`NO_PROGRESS`**: Model returned identical SQL across repair attempts without making progress.
-- **`SPEC_INVALID`**: MigrationSpec failed schema validation checks against the live database schema (e.g. unknown target table, missing source column).
-- **`PLAN_FAILED`**: Model failed to generate a valid MigrationSpec conforming to JSONSchema.
-- **`MODEL_RETURNED_NO_SQL`**: Model produced consecutive responses containing no executable SQL statements.
-- **`STEP_BUDGET_EXHAUSTED`**: Step budget exceeded without satisfying all verification invariants.
-- **`WALL_CLOCK_TIMEOUT`**: Total agent execution time exceeded the configured wall-clock budget (default 180s).
+#### CLI Exit Codes:
+- `0`: **VERIFIED** — Invariants passed and oracle assertions confirmed. Safe to deploy.
+- `1`: **FAILED** — Constraint violation, data loss, or execution crash detected.
+- `2`: **UNVERIFIED** — Invariant checks passed, but custom transforms require human review.
 
 ---
 
-## 🧪 Testing & Evaluation
+### 3. Run the Test Suite (Offline / Fake LLM)
+Run all 185+ unit, integration, and regression tests offline without needing network access or an API key:
 
-### Offline Unit & Integration Tests (Fake LLM, Zero Network)
-Run the full 51-test suite locally without requiring an API key or network access:
 ```bash
-pytest -q
-```
-Includes:
-- **Unit Tests (`test_unit.py`):** Key loading (BOM, UTF-16, quotes, placeholders), model resolution, sandbox authorizer, deadline handler, SQL cleaner, oracle transforms.
-- **Integration Tests (`test_integration.py`):** Real SQLite fixture with indexes, views, triggers, and foreign keys tested under both FK ON and OFF modes.
-- **Mutation Corpus (`test_mutations.py`):** 17 intentional defect scenarios (row loss, duplicate rows, broken FKs, dropped indexes, dropped views/triggers, type coercion, silent truncations, leftover temp tables, sandbox escapes) — every single one is caught and flagged.
-- **Agent Loop Tests (`test_agent_loop.py`):** Multi-step repair loops, model escalation, budget exhaustion, error recovery.
-- **Streamlit App Tests (`test_app.py`):** Session state persistence and error handling.
-
-### Chinook Real-Database Demo
-Execute real migrations against a cloned Chinook database (tracks, artists, albums, customers) with byte-identical source verification:
-```bash
-python evals/demo_chinook.py
+pytest -v
 ```
 
-### Live Nebius Evaluation Suite (Requires Valid API Key)
-Benchmarks Nemotron Super vs. Tiered Routing vs. Nemotron Ultra across 13 real-world migration tasks:
+Run specific test modules:
 ```bash
-python evals/run_evals.py
+# Verify rollback roundtrip & lossy classification
+pytest tests/test_rollback.py
+
+# Verify oscillation detection & sentinel foreign key recipes
+pytest tests/test_oscillation_fix.py
+
+# Verify 17 intentional data-mutation traps
+pytest tests/test_mutations.py
 ```
 
-### Scale & Verification Performance Benchmark (`scripts/bench.py`)
-Run the scaling benchmark across 10k, 100k, and 400k row scale tiers:
+---
+
+### 4. Run the Scale & Performance Benchmark
+Test how the Time Machine scales across 10,000, 100,000, and 400,000 row datasets:
+
 ```bash
-python scripts/bench.py
+python scripts/bench.py --rows 100000
 ```
 
-#### Targets & Performance Results:
-- **100k rows invariants & oracle verification target**: $\le 1.0\text{s}$ (Measured: **~574 ms** — **PASS**)
-- **400k rows invariants & oracle verification target**: $\le 3.0\text{s}$ (Measured: **~1.90 s** — **PASS**)
-- **Memory footprint**: Flat $O(1)$ memory streaming via `fetchmany(5000)` and SQL aggregate pushdowns (above 20k rows, audits all trap rows, a deterministic 5k sample, and aggregate checksums).
+#### Benchmark Targets & Measured Results:
+- **100k rows invariants & oracle verification target**: $\le 1.0\text{s}$ (Measured: **~569 ms** — **PASS**)
+- **400k rows invariants & oracle verification target**: $\le 3.0\text{s}$ (Measured: **~2.12 s** — **PASS**)
+- **Memory footprint**: Flat $O(1)$ memory streaming using `fetchmany(5000)` and SQL aggregate pushdowns.
 
 | Scale Tier | Clone (ms) | Profile (ms) | Migration Exec (ms) | Invariants & Oracle (ms) | Rollback (ms) | Audit Mode |
 |---|---|---|---|---|---|---|
-| **10,000 rows** | 0.41 ms | 30.71 ms | 4.32 ms | 157.48 ms | 77.06 ms | Exact (Full) |
-| **100,000 rows** | 4.07 ms | 195.73 ms | 53.26 ms | 574.07 ms | 854.95 ms | Sampled (5k+traps) |
-| **400,000 rows** | 14.59 ms | 198.12 ms | 216.57 ms | 1897.62 ms | 3720.14 ms | Sampled (5k+traps) |
+| **10,000 rows** | 0.6 ms | 31.34 ms | 6.45 ms | 181.06 ms | 78.06 ms | Exact (Full) |
+| **100,000 rows** | 4.91 ms | 231.9 ms | 51.78 ms | 569.27 ms | 1041.41 ms | Sampled (5k+traps) |
+| **400,000 rows** | 19.89 ms | 223.87 ms | 239.38 ms | 2120.48 ms | 4508.61 ms | Sampled (5k+traps) |
 
 ---
 
-## 🏗️ Architecture & Model Routing
+### 5. Run Static Analysis & Linters
+```bash
+# Run Ruff linter
+ruff check timemachine/ tests/
 
-- **Inference Provider:** [Nebius Token Factory](https://tokenfactory.nebius.com/) (`https://api.tokenfactory.nebius.com/v1/`)
-- **Fast Drafting Model:** `nvidia/nemotron-3-super-120b-a12b` ("Super") — Ultra-low latency draft generation.
-- **Self-Healing Reasoning Model:** `nvidia/Nemotron-3-Ultra-550b-a55b` ("Ultra") — Deep multi-step repair when audits flag constraint violations or data loss.
-- **Database Engine:** `sqlite3` with high-speed in-memory `Connection.backup()` RAM cloning (fast backup and restore times tracked separately).
-- **Dialect Analysis:** `sqlglot` for transactional statement classification and dangerous operation linting.
+# Run Pyflakes
+pyflakes timemachine/ tests/
+```
+
+---
+
+## 🖥️ The 5-Step Web Dashboard Workflow
+
+1. **🔌 Tab 1: Connect**
+   - Choose a built-in realistic scenario (e.g., *Department Normalization* or *Salary Banding*), upload a `.sqlite`/`.db` file, upload a `.sql` schema dump, or specify a local file path.
+   - Inspect table schemas, row counts, secondary indexes, foreign keys, triggers, and views in read-only mode.
+   - Configure sandbox limits (size cap, timeouts, foreign key enforcement).
+
+2. **📋 Tab 2: Plan**
+   - Provide a natural language migration goal statement.
+   - The AI drafts a structured **`MigrationSpec`** containing affected tables, column mappings, transform functions, and null policies.
+   - Inspect the generated plan and check the approval box before any migration SQL is drafted.
+
+3. **⚡ Tab 3: Run**
+   - Start the autonomous dry-run agent loop.
+   - Watch live tool-calling activity (`get_schema`, `profile_table`, `run_on_clone`, `explain`).
+   - Observe real-time progress as Nemotron drafts and self-repairs SQL against adversarial traps in an isolated RAM clone.
+
+4. **📊 Tab 4: Result**
+   - **Certification Banner:** Clear status badge (`🟢 VERIFIED`, `🟡 UNVERIFIED`, or `🔴 FAILED`).
+   - **Forward Migration (`up.sql`):** Transaction-wrapped SQL with pre-checks and the standard 12-step table rebuild.
+   - **Reversible Rollback (`down.sql`):** Verified roundtrip script to restore the baseline table.
+   - **Rollback Classification:**
+     - `✅ Verified` (`EXACT` / `EQUIVALENT_AFTER_NORMALIZATION`): Zero data loss.
+     - `⚠️ Lossy`: Warns if the migration goal permanently erased or merged dirty historical data (e.g. orphan codes mapped to `NULL` or `'UNASSIGNED'`).
+     - `❌ Failed` (`BROKEN`): The rollback script failed to restore the original table.
+   - **Exporters:** One-click downloads for Plain SQL, Flyway migrations, and Alembic versions.
+
+5. **📜 Tab 5: History**
+   - Audit trail of previous runs stored in local SQLite (`.timemachine/runs.db`).
+   - Review token counts, timings, prompt hashes, and model escalation steps.
+
+---
+
+## 🛡️ Core Verification & Safety Architecture
+
+### 1. Invariant Engine (What IS Verified)
+- **Zero Silent Data Loss:** Explicit row accounting distinguishing between deletions (loss) and row duplications.
+- **Primary Key Set Invariant:** Exact cryptographic set equality of primary keys before and after migration.
+- **Untouched Column Checksums:** Columns declared unchanged must have identical byte checksums.
+- **Foreign Key Referential Integrity:** Runs baseline-subtracted `PRAGMA foreign_key_check` under both `FK = ON` and `OFF`.
+- **Database Object Preservation:** Secondary indexes, triggers, and views are automatically detected and verified on the rebuilt table.
+- **No Leftover Staging Tables:** Ensures temporary tables (`_new`, `_old`, `_tmp`) are safely cleaned up.
+
+### 2. Row-Level Reference Oracles
+- Transforms from the reference library (`split_name_first`, `split_name_last`, `strip_honorific`, `cast_int`, `cast_cents`, `default_if_null`, `map_via_lookup`, `normalize_date`, `trim_case`) are verified against independent Python reference functions.
+- If all invariants and oracle checks pass, the status is certified **`VERIFIED`**.
+
+### 3. Security Sandbox
+- **Authorizer Callback (`set_authorizer`):** Blocks `ATTACH`, `DETACH`, `VACUUM INTO`, `load_extension`, and dangerous administrative PRAGMAs. Only 12 safe inspection PRAGMAs are permitted.
+- **Progress Handler Deadline:** Hardware progress handler interrupts execution if an LLM query exceeds the scaled sandbox timeout limit (2.0s–30.0s).
+- **Privacy Masking:** Names, emails, and phone numbers are masked into aggregate distributions before entering LLM prompts. Real customer rows are never transmitted.
+
+### 4. Advanced Repair & Escalation Engine
+- **2-Step Sentinel Foreign Key Pattern:** Teaches the agent to seed parent tables before inserting orphan records into child tables (`INSERT OR IGNORE INTO parent ...`), preventing foreign key crashes.
+- **Automatic Rollback Nullability Relaxation:** Strips unwarranted `NOT NULL` constraints from rollback table definitions if the column was nullable in the baseline schema.
+- **Repair Oscillation Detector:** Detects ping-pong loops between `FOREIGN KEY` constraints and `DATA_MISMATCH` errors and provides corrective recipes.
+- **Dual-Tier Model Routing:** Starts with fast drafting via **Nemotron-3-Super (120B)** and escalates to **Nemotron-3-Ultra (550B)** when deep multi-step reasoning is required.
+
+---
+
+## 📁 Repository Structure
+
+```
+.
+├── app.py                     # Streamlit 5-tab web dashboard
+├── Dockerfile                 # Production Docker configuration
+├── requirements.txt           # Core Python dependencies
+├── .env.example               # Environment template for Nebius API key
+│
+├── timemachine/               # Core Time Machine Engine
+│   ├── config.py              # Application settings, timeouts, and env loading
+│   ├── adapters/              # Database adapters & introspection (SQLite, PostgreSQL)
+│   ├── agent/                 # Autonomous agent loop, prompts, planner, and tools
+│   ├── traps/                 # Adversarial edge-case generator and profiler
+│   ├── verify/                # Invariant checker, reference oracles, and sandbox
+│   ├── export/                # Exporters for Plain SQL, Flyway, and Alembic
+│   └── ui/                    # Streamlit UI tabs, components, and views
+│
+├── scripts/
+│   └── bench.py               # 10k, 100k, 400k scale performance benchmark
+│
+├── evals/
+│   ├── demo_chinook.py        # Real-world migration on Chinook database
+│   └── run_evals.py           # Evaluation battery against Nebius API
+│
+└── tests/                     # Test suite (185+ passing tests)
+    ├── test_unit.py           # Unit tests (keys, models, sandbox, cleaner)
+    ├── test_integration.py    # Integration tests on real SQLite fixtures
+    ├── test_mutations.py      # Corpus of 17 intentional migration bugs
+    ├── test_agent_loop.py     # Multi-turn agent repair and budget tests
+    ├── test_rollback.py       # Rollback verification and classification
+    └── test_oscillation_fix.py# Sentinel patterns and oscillation detection
+```
+
+---
+
+## 🏗️ Model & Infrastructure Stack
+
+- **AI Inference:** [Nebius Token Factory](https://tokenfactory.nebius.com/)
+- **Drafting Model:** `nvidia/nemotron-3-super-120b-a12b` (Low latency)
+- **Deep Repair Model:** `nvidia/Nemotron-3-Ultra-550b-a55b` (Advanced reasoning)
+- **Database Engine:** `sqlite3` with in-memory `Connection.backup()` RAM cloning
+- **SQL Analysis:** `sqlglot` for transactional statement classification and AST validation
+- **Web Interface:** `streamlit` with stateful session management
 
 ---
 
