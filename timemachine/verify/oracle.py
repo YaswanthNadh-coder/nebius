@@ -104,7 +104,7 @@ def default_if_null(val: Any, default: Any = "") -> Any:
     return val
 
 
-def map_via_lookup(val: Any, lookup_dict: dict[str, str], default: str = "UNASSIGNED") -> str:
+def map_via_lookup(val: Any, lookup_dict: dict[str, str], default: Any = "UNASSIGNED") -> Any:
     """Map foreign key or code via dictionary, falling back to default."""
     if val is None:
         return default
@@ -196,7 +196,18 @@ def compute_oracle_row(
             computed = default_if_null(val, m.default_value)
         elif trans in ("map_via_lookup", "lookup"):
             tbl_lookups = lookup_data.get(m.lookup_table or "", {})
-            def_lk = str(m.default_value) if m.default_value is not None else "UNASSIGNED"
+            if m.default_value is not None:
+                def_lk = str(m.default_value)
+            elif m.orphan_policy and m.orphan_policy.lower().startswith("default:"):
+                def_lk = m.orphan_policy.split(":", 1)[1]
+            elif m.orphan_policy and m.orphan_policy.lower() not in ("null", "none", "reject", "drop"):
+                def_lk = str(m.orphan_policy)
+            elif m.orphan_policy and m.orphan_policy.lower() in ("null", "none"):
+                def_lk = None
+            elif m.null_policy == "not_null":
+                def_lk = "UNASSIGNED"
+            else:
+                def_lk = None
             computed = map_via_lookup(val, tbl_lookups, default=def_lk)
         elif trans in ("normalize_date", "date"):
             computed = normalize_date(val)

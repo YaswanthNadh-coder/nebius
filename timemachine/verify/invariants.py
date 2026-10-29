@@ -432,29 +432,21 @@ def evaluate_migration_invariants(
                 m_cur.execute(f'SELECT COUNT(*) FROM "{other_tbl}"')
                 m_cnt = m_cur.fetchone()[0]
 
-                # If other_tbl is a referenced parent table and has seeded sentinel row(s)
-                if other_tbl in parent_tables and m_cnt >= b_cnt and (m_cnt - b_cnt <= 10):
+                # Non-target tables: all baseline rows must be completely preserved.
+                # Seeding up to 10 sentinel/lookup rows (e.g. 'UNASSIGNED') is permitted as long as
+                # every original baseline row is fully intact (b_data_set.issubset(m_data_set)).
+                if m_cnt >= b_cnt and (m_cnt - b_cnt <= 10):
                     b_cur.execute(f'SELECT * FROM "{other_tbl}"')
-                    b_data_set = set(b_cur.fetchall())
+                    b_data_set = set(tuple(r) for r in b_cur.fetchall())
                     m_cur.execute(f'SELECT * FROM "{other_tbl}"')
-                    m_data_set = set(m_cur.fetchall())
+                    m_data_set = set(tuple(r) for r in m_cur.fetchall())
                     if b_data_set.issubset(m_data_set):
-                        passed_checks.append(f"NON_TARGET_TABLE_UNTOUCHED_{other_tbl} (sentinel seeded)")
+                        tag = " (sentinel seeded)" if m_cnt > b_cnt else ""
+                        passed_checks.append(f"NON_TARGET_TABLE_UNTOUCHED_{other_tbl}{tag}")
                     else:
                         failed_checks.append(f"NON_TARGET_TABLE_MUTATED: Table '{other_tbl}' was unexpectedly modified.")
-                elif b_cnt != m_cnt:
-                    failed_checks.append(f"NON_TARGET_TABLE_MUTATED: Table '{other_tbl}' was unexpectedly modified.")
-                elif b_cnt <= 5000:
-                    b_cur.execute(f'SELECT * FROM "{other_tbl}"')
-                    b_data = b_cur.fetchall()
-                    m_cur.execute(f'SELECT * FROM "{other_tbl}"')
-                    m_data = m_cur.fetchall()
-                    if b_data != m_data:
-                        failed_checks.append(f"NON_TARGET_TABLE_MUTATED: Table '{other_tbl}' was unexpectedly modified.")
-                    else:
-                        passed_checks.append(f"NON_TARGET_TABLE_UNTOUCHED_{other_tbl}")
                 else:
-                    passed_checks.append(f"NON_TARGET_TABLE_UNTOUCHED_{other_tbl}")
+                    failed_checks.append(f"NON_TARGET_TABLE_MUTATED: Table '{other_tbl}' was unexpectedly modified.")
             except Exception as exc:
                 failed_checks.append(f"NON_TARGET_TABLE_ERROR: Table '{other_tbl}': {exc}")
 

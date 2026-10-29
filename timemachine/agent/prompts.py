@@ -76,7 +76,15 @@ def generate_transform_contract(spec: MigrationSpec) -> str:
                 func_name = "passthrough"
 
             fn = getattr(oracle, func_name, None)
-            doc = fn.__doc__.strip() if fn and fn.__doc__ else f"Apply {trans_name} transform."
+            if func_name == "map_via_lookup":
+                if m.default_value is not None:
+                    doc = f"Map code via lookup table '{m.lookup_table or 'parent'}'; unmapped codes and NULLs map to sentinel {m.default_value!r}. (Requires seeding '{m.lookup_table or 'parent'}' first)."
+                elif m.orphan_policy and m.orphan_policy.lower() not in ("null", "none", "reject", "drop"):
+                    doc = f"Map code via lookup table '{m.lookup_table or 'parent'}'; unmapped codes and NULLs map to sentinel {m.orphan_policy!r}. (Requires seeding '{m.lookup_table or 'parent'}' first)."
+                else:
+                    doc = f"Map code via lookup table '{m.lookup_table or 'parent'}'; unmapped codes and NULLs map to NULL (None)."
+            else:
+                doc = fn.__doc__.strip() if fn and fn.__doc__ else f"Apply {trans_name} transform."
             src_str = f" from {m.source_column}" if m.source_column else ""
             def_str = f" (default: {m.default_value!r})" if m.default_value is not None else ""
             orphan_str = f" [orphan_policy: {m.orphan_policy}]" if m.orphan_policy else ""

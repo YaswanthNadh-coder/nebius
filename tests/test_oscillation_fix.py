@@ -11,6 +11,7 @@ from timemachine.verify.invariants import (
     audit_crash_diagnostics,
     evaluate_migration_invariants,
 )
+from timemachine.verify.oracle import verify_rows_with_oracle
 from timemachine.verify.rebuild import sanitize_down_script, verify_rollback_roundtrip
 from timemachine.verify.spec import ColumnMapping, MigrationSpec
 
@@ -380,5 +381,42 @@ def test_format_previous_attempts_block_detects_not_null_oscillation():
 
     block = format_previous_attempts_block(history)
     assert "REPAIR OSCILLATION DETECTED BETWEEN NOT NULL EXECUTION CRASH AND UNTOUCHED COLUMN PRESERVATION" in block
+
+
+def test_oracle_lookup_orphan_policy_null_maps_to_none():
+    """When orphan_policy is 'null' and default_value is None, map_via_lookup maps unmapped codes to None."""
+    orig_rows = [
+        {"id": 1, "dept": "ENG"},
+        {"id": 2, "dept": "LEGACY_99"},
+        {"id": 3, "dept": None},
+    ]
+    migrated_by_pk = {
+        "1": {"id": 1, "department_code": "ENG"},
+        "2": {"id": 2, "department_code": None},
+        "3": {"id": 3, "department_code": None},
+    }
+    mapping = ColumnMapping(
+        new_column="department_code",
+        source_column="dept",
+        transform="map_via_lookup",
+        lookup_table="departments",
+        lookup_key="dept_code",
+        lookup_val="dept_code",
+        orphan_policy="null",
+        default_value=None,
+    )
+    lookup_data = {"departments": {"ENG": "ENG", "MKT": "MKT"}}
+
+    matched, mismatches, examples = verify_rows_with_oracle(
+        orig_rows,
+        migrated_by_pk,
+        [mapping],
+        lookup_data=lookup_data,
+        pk_column="id",
+    )
+    assert matched is True
+    assert mismatches == {}
+    assert examples == []
+
 
 
