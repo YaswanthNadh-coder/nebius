@@ -90,10 +90,18 @@ def get_sqlite_gotchas_block() -> str:
     permitted = ", ".join(sorted(ALLOWED_PRAGMAS))
     return f"""SQLite Gotchas & Execution Rules:
 - CRITICAL RULE FOR TABLE REBUILDS (CREATE TABLE ..._new): Preserve the exact nullability of every existing column from the original CREATE TABLE DDL. NEVER add NOT NULL to an existing nullable column (such as salary, created_at, etc.) unless the migration goal explicitly asks to make that specific column NOT NULL. Whenever any target column IS declared NOT NULL, you MUST wrap its corresponding SELECT expression in COALESCE(column_name, <sensible_default_matching_type>) for ALL such columns at once.
+- 2-STEP SENTINEL FOREIGN KEY PATTERN:
+  When a foreign key column requires a sentinel default value (e.g. 'UNASSIGNED') for orphan or NULL keys:
+  1. Seed Parent Table FIRST before creating or inserting into child table:
+     INSERT OR IGNORE INTO parent_table (pk_col, name_col) VALUES ('UNASSIGNED', 'Unassigned');
+  2. In child SELECT statement, map orphan keys to the sentinel:
+     CASE WHEN col IS NOT NULL AND col IN (SELECT pk_col FROM parent_table) THEN col ELSE 'UNASSIGNED' END AS col
+  3. In DOWN (ROLLBACK) migration, remove the seeded sentinel row:
+     DELETE FROM parent_table WHERE pk_col = 'UNASSIGNED';
+- CRITICAL RULE FOR DOWN (ROLLBACK) MIGRATION: The DOWN migration must restore the table to the exact original baseline schema. In your table rebuild, use a temporary table (such as target_restore or target_old) with the EXACT column types and nullability from the baseline schema. NEVER add NOT NULL or new FOREIGN KEY constraints to columns that were nullable in the baseline schema (such as salary, department, created_at).
 - In 12-step table rebuilds, map orphan keys according to orphan_policy before inserting; never disable enforcement to hide violations. Always execute 'PRAGMA foreign_key_check;' before 'COMMIT;'.
 - In 'CREATE TABLE target_new (...)', preserve the EXACT column nullability and defaults from the original schema for all untouched columns (e.g. if salary was nullable in the original schema, it MUST remain nullable; do NOT add NOT NULL to columns that were not originally NOT NULL).
 - In 'INSERT INTO target_new (...) SELECT ... FROM target', explicitly list ALL columns in both INSERT and SELECT clauses (including untouched columns like id, salary, created_at). Never omit untouched columns or SQLite will fail NOT NULL constraints.
-- If creating a FOREIGN KEY reference to a parent table (e.g. departments), map orphan foreign keys according to orphan_policy before inserting (e.g. map orphan codes to NULL or insert parent lookup record first); never disable enforcement to hide violations.
 - Preserve the exact constraints (PRIMARY KEY, NOT NULL, DEFAULT) for all untouched columns from the original table schema.
 - TRIM(x) only removes standard spaces; to strip tabs, newlines, and carriage returns, use: TRIM(x, ' ' || char(9) || char(10) || char(13))
 - INSTR(string, substring) returns 0 when substring is not found (1-indexed).
@@ -132,7 +140,8 @@ def build_dynamic_task_checklist(result: InvariantResult | None) -> list[str]:
     # 4. Data Mismatch
     if "DATA_MISMATCH" in failed_text or "MISMATCH" in failed_text or "ORACLE" in failed_text:
         checklist.append(
-            "Fix data mismatch: compare actual output against the Transform Contract. Use TRIM(x, ' ' || char(9) || char(10) || char(13)) to handle whitespace and verify splitting boundaries."
+            "Fix data mismatch: compare actual output against the Transform Contract. Use TRIM(x, ' ' || char(9) || char(10) || char(13)) to handle whitespace. "
+            "If an expected sentinel value (e.g. 'UNASSIGNED') failed because of a FOREIGN KEY constraint, remember to seed the sentinel into the referenced parent table first using 'INSERT OR IGNORE INTO parent_table ...'."
         )
 
     # 5. Sandbox Violations
@@ -145,7 +154,10 @@ def build_dynamic_task_checklist(result: InvariantResult | None) -> list[str]:
     # 6. Foreign Key Failures
     if "FOREIGN KEY" in failed_text or "FOREIGN_KEY" in failed_text:
         checklist.append(
-            "Fix foreign key failure: map orphan keys according to orphan_policy before inserting; never disable enforcement to hide violations. Ensure orphan records (keys not in parent table) are safely mapped or defaulted before 'PRAGMA foreign_key_check;'."
+            "Fix foreign key failure: If a sentinel value (such as 'UNASSIGNED') is expected for orphan/NULL foreign keys, apply the 2-step Sentinel Foreign Key Pattern: "
+            "(1) First execute 'INSERT OR IGNORE INTO parent_table ...' to seed the sentinel key before child insertion. "
+            "(2) Map orphan and NULL keys in your SELECT: CASE WHEN col IS NOT NULL AND col IN (SELECT pk FROM parent_table) THEN col ELSE 'UNASSIGNED' END. "
+            "(3) In your DOWN migration, clean up the sentinel row: DELETE FROM parent_table WHERE pk = 'UNASSIGNED'."
         )
 
     # 7. Untouched Columns Mutation
@@ -228,7 +240,7 @@ def build_migration_prompt(
             "Requirements:\n"
             "1. Rebuild tables following SQLite standard 12-step table rebuild (create new table, copy data, drop old, rename, recreate indexes/triggers/views).\n"
             "2. Preserve all data records without silent drops.\n"
-            "3. Output BOTH ```sql -- UP MIGRATION ``` and ```sql -- DOWN MIGRATION (ROLLBACK) ```.\n"
+            "3. Output BOTH ```sql -- UP MIGRATION ``` and ```sql -- DOWN MIGRATION (ROLLBACK) ```. The DOWN migration must restore the original baseline table schema without adding NOT NULL to nullable columns (like salary, created_at).\n"
             f"4. The schema is already above; do not call get_schema. You have at most {max_tool_calls} tool calls; finish with submit.\n"
             "5. CRITICAL RULE FOR TABLE REBUILDS (CREATE TABLE ..._new): Preserve the exact nullability of every existing column from the original CREATE TABLE DDL. NEVER add NOT NULL to an existing nullable column (such as salary, created_at, etc.) unless the migration goal explicitly asks to make that specific column NOT NULL. Whenever any target column IS declared NOT NULL, you MUST wrap its corresponding SELECT expression in COALESCE(column_name, <sensible_default_matching_type>) for ALL such columns at once.\n"
             "6. In the INSERT INTO target_new (...) SELECT ... FROM target statement, explicitly list every column name in both the INSERT and SELECT clauses.\n"
@@ -268,6 +280,45 @@ def format_previous_attempts_block(history: Any) -> str:
         lines.append("\n### Requirements discovered so far (all must still hold):")
         for i, req in enumerate(reqs, 1):
             lines.append(f"{i}. {req}")
+
+    # Detect repair oscillations across attempts
+    has_fk_fail = any(
+        "FOREIGN KEY" in " ".join(r.failed_check_types).upper()
+        or (getattr(r, "error_message", None) and "FOREIGN KEY" in r.error_message.upper())
+        for r in history.records
+    )
+    has_dm_fail = any(
+        "DATA_MISMATCH" in " ".join(r.failed_check_types).upper()
+        or (getattr(r, "error_message", None) and "DATA_MISMATCH" in r.error_message.upper())
+        for r in history.records
+    )
+    if has_fk_fail and has_dm_fail:
+        lines.append(
+            "\n🚨 REPAIR OSCILLATION DETECTED BETWEEN FOREIGN KEY CONSTRAINT AND SENTINEL DATA MISMATCH:\n"
+            "You are oscillating between:\n"
+            "  - Setting invalid/orphan keys to NULL (which avoids FK errors, but fails DATA_MISMATCH because the oracle expects a sentinel value like 'UNASSIGNED')\n"
+            "  - Setting invalid/orphan keys to 'UNASSIGNED' without seeding the parent table (which crashes SQLite with 'FOREIGN KEY constraint failed')\n"
+            "DO NOT continue this loop! Break out of the oscillation by applying the 2-step Sentinel Foreign Key Pattern:\n"
+            "  Step 1: Execute 'INSERT OR IGNORE INTO parent_table ... VALUES ('UNASSIGNED', ...);' BEFORE the child table insert.\n"
+            "  Step 2: Use 'CASE WHEN col IS NOT NULL AND col IN (SELECT pk FROM parent_table) THEN col ELSE 'UNASSIGNED' END' in your SELECT.\n"
+            "  Step 3: In your DOWN migration, clean up the sentinel row: 'DELETE FROM parent_table WHERE pk = 'UNASSIGNED';'."
+        )
+
+    has_nn_fail = any(
+        "NOT NULL" in " ".join(r.failed_check_types).upper()
+        or (getattr(r, "error_message", None) and "NOT NULL" in r.error_message.upper())
+        for r in history.records
+    )
+    has_unchanged_fail = any(
+        "UNTOUCHED_COLUMN_MUTATED" in " ".join(r.failed_check_types).upper()
+        or "SCHEMA_CONSTRAINT_VIOLATION" in " ".join(r.failed_check_types).upper()
+        for r in history.records
+    )
+    if has_nn_fail and has_unchanged_fail:
+        lines.append(
+            "\n🚨 REPAIR OSCILLATION DETECTED BETWEEN NOT NULL EXECUTION CRASH AND UNTOUCHED COLUMN PRESERVATION:\n"
+            "Remember: If a column was NULLABLE in the original baseline schema (such as salary, created_at), NEVER add 'NOT NULL' to it in your CREATE TABLE statement! Keep it nullable so baseline NULL values pass through unchanged."
+        )
 
     return "\n".join(lines) + "\n"
 

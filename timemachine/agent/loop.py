@@ -38,7 +38,11 @@ from timemachine.verify.invariants import (
     audit_crash_diagnostics,
     evaluate_migration_invariants,
 )
-from timemachine.verify.rebuild import estimate_production_lock_time, verify_rollback_roundtrip
+from timemachine.verify.rebuild import (
+    estimate_production_lock_time,
+    sanitize_down_script,
+    verify_rollback_roundtrip,
+)
 from timemachine.verify.spec import MigrationSpec
 
 logger = get_logger("agent.loop")
@@ -1301,6 +1305,17 @@ def run_time_machine_agent(
         base_clone = sqlite3.connect(":memory:", check_same_thread=False)
         base_snapshot.backup(base_clone)
         try:
+            # Query baseline table DDL and nullable columns
+            cur_snap = base_snapshot.cursor()
+            cur_snap.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (target_table,))
+            snap_row = cur_snap.fetchone()
+            baseline_table_ddl = snap_row[0] if snap_row else ""
+            cur_snap.execute(f'PRAGMA table_info("{target_table}")')
+            b_cols_meta = cur_snap.fetchall()
+            nullable_cols = [r[1] for r in b_cols_meta if not r[3] and r[5] == 0]
+
+            final_down = sanitize_down_script(final_down, nullable_cols)
+
             rb_res = verify_rollback_roundtrip(
                 base_clone,
                 final_up,
@@ -1339,10 +1354,18 @@ Error: {rb_res.error}
 Missing/Lossy columns: {rb_res.lossy_columns}
 Sample diffs: {diffs_text}
 
+Pre-Migration Baseline Schema for '{target_table}':
+```sql
+{baseline_table_ddl}
+```
+Baseline Nullable Columns: {nullable_cols}
+
 CRITICAL RULES FOR DOWN (ROLLBACK) MIGRATION:
-1. The DOWN migration must restore table '{target_table}' to its original baseline schema.
-2. NEVER add NOT NULL or new FOREIGN KEY constraints to columns that were nullable in the pre-migration baseline schema (such as salary, department, created_at).
-3. Do NOT mutate or alter untouched data values during rollback.
+1. The DOWN migration must restore table '{target_table}' to its original baseline schema above.
+2. In your table rebuild (e.g. CREATE TABLE {target_table}_restore ...), preserve the EXACT column nullability from the baseline schema above. NEVER add NOT NULL to columns that were nullable in the baseline: {nullable_cols}.
+3. If the UP migration inserted sentinel rows into referenced parent tables (e.g. 'UNASSIGNED'), clean them up:
+   DELETE FROM parent_table WHERE pk = 'UNASSIGNED';
+4. Do NOT mutate or alter untouched data values during rollback.
 
 Task: Provide ONLY the corrected DOWN migration inside a ```sql block to restore table '{target_table}' to its original baseline state."""
 
@@ -1361,7 +1384,7 @@ Task: Provide ONLY the corrected DOWN migration inside a ```sql block to restore
                     if not new_down:
                         new_down = clean_sql(content)
                     if new_down and has_ddl_or_dml(new_down):
-                        final_down = new_down
+                        final_down = sanitize_down_script(new_down, nullable_cols)
                         rb_res = verify_rollback_roundtrip(
                             base_clone,
                             final_up,

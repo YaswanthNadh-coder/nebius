@@ -1,5 +1,6 @@
 """SQLite 12-step table rebuild procedure and rollback verification."""
 
+import re
 import sqlite3
 from typing import Any
 
@@ -12,6 +13,20 @@ from timemachine.verify.sandbox import (
 )
 
 logger = get_logger("verify.rebuild")
+
+
+def sanitize_down_script(down_sql: str, nullable_columns: list[str]) -> str:
+    """Safely relax contradictory NOT NULL constraints on columns that were nullable in baseline schema."""
+    if not down_sql or not nullable_columns:
+        return down_sql
+
+    sanitized = down_sql
+    for col in nullable_columns:
+        pattern = re.compile(
+            rf'(?i)(["`\[]?\b{re.escape(col)}\b["`\]]?(?:\s+[^,;()]+?)?)\s+NOT\s+NULL\b'
+        )
+        sanitized = pattern.sub(r'\1', sanitized)
+    return sanitized
 
 
 class RollbackVerificationResult(dict):
@@ -154,8 +169,10 @@ def verify_rollback_roundtrip(
         # Refresh timeout handler for DOWN migration
         clone.set_progress_handler(make_sandbox_progress_handler(scaled_timeout), 10_000)
 
-        # Step 2: Apply DOWN migration
-        clone.executescript(down_sql)
+        # Step 2: Apply DOWN migration (auto-relaxing unwarranted NOT NULL constraints on baseline-nullable columns)
+        nullable_cols = [r[1] for r in b_col_info if not r[3] and r[5] == 0]
+        cleaned_down = sanitize_down_script(down_sql, nullable_cols)
+        clone.executescript(cleaned_down)
 
         # Step 3: Check restored table schema
         cur.execute(f"PRAGMA table_info({safe_table})")

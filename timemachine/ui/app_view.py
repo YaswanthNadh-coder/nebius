@@ -592,7 +592,10 @@ def render_result_tab():
 
     # Top Status Banner
     if res.status == "VERIFIED":
-        st.success("### 🟢 STATUS: VERIFIED (All Invariants & Reference Oracles Passed)")
+        if res.rollback_verified:
+            st.success("### 🟢 STATUS: VERIFIED (All Invariants, Oracles & Rollback Passed)")
+        else:
+            st.warning("### 🟡 STATUS: FORWARD MIGRATION VERIFIED (Rollback Roundtrip Needs Attention)")
     elif res.status == "UNVERIFIED":
         st.warning("### 🟡 STATUS: UNVERIFIED (Invariants Passed, Custom Oracle Needs Review)")
     else:

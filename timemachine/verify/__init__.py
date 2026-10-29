@@ -20,6 +20,7 @@ from timemachine.verify.oracle import (
 )
 from timemachine.verify.rebuild import (
     estimate_production_lock_time,
+    sanitize_down_script,
     verify_rollback_roundtrip,
 )
 from timemachine.verify.sandbox import (
@@ -52,5 +53,6 @@ __all__ = [
     "audit_null_crash_diagnostics",
     "evaluate_migration_invariants",
     "verify_rollback_roundtrip",
+    "sanitize_down_script",
     "estimate_production_lock_time",
 ]

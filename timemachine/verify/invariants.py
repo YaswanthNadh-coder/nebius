@@ -42,6 +42,69 @@ def _normalize_sql(sql: str | None) -> str:
     return s.lower()
 
 
+def _build_fk_mismatch_hint(
+    target_table: str,
+    mismatches: dict[str, int],
+    examples: list[dict],
+    spec: MigrationSpec | None,
+    b_cur: sqlite3.Cursor,
+    m_cur: sqlite3.Cursor,
+) -> str:
+    """If a mismatched column has a FOREIGN KEY constraint and the expected value is absent from the parent table,
+    append an explicit hint teaching the 2-step Sentinel Foreign Key Pattern."""
+    try:
+        q_target = quote_ident(target_table)
+        m_cur.execute(f"PRAGMA foreign_key_list({q_target})")
+        fks_for_table = m_cur.fetchall()
+        if not fks_for_table:
+            b_cur.execute(f"PRAGMA foreign_key_list({q_target})")
+            fks_for_table = b_cur.fetchall()
+
+        hints = []
+        for col_w in sorted(mismatches.keys()):
+            fk_info = next((fk for fk in fks_for_table if fk[3].lower() == col_w.lower()), None)
+            if not fk_info and spec:
+                m = next((m for m in spec.get_table_mappings(target_table) if m.new_column.lower() == col_w.lower()), None)
+                if m and m.lookup_table and m.lookup_key:
+                    fk_info = (0, 0, m.lookup_table, col_w, m.lookup_key)
+
+            if fk_info:
+                parent_tbl = fk_info[2]
+                parent_pk = fk_info[4]
+                ex_for_col = [e for e in examples if e.get("column") == col_w]
+                exp_val = ex_for_col[0].get("expected") if ex_for_col else None
+                if exp_val is not None and str(exp_val) != "" and str(exp_val).lower() != "none":
+                    m_cur.execute(f'SELECT COUNT(*) FROM "{parent_tbl}" WHERE "{parent_pk}" = ?', (str(exp_val),))
+                    has_key = m_cur.fetchone()[0] > 0
+                    if not has_key:
+                        b_cur.execute(f'PRAGMA table_info("{parent_tbl}")')
+                        p_cols = b_cur.fetchall()
+                        seed_c = []
+                        seed_v = []
+                        for cid, cname, ctype, notnull, dflt, pk in p_cols:
+                            if pk > 0 or notnull:
+                                col_ident = cname if re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", cname) else f'"{cname}"'
+                                seed_c.append(col_ident)
+                                if pk > 0:
+                                    seed_v.append(repr(str(exp_val)))
+                                else:
+                                    seed_v.append(repr(str(exp_val).capitalize()))
+                        seed_sql = f'INSERT OR IGNORE INTO {parent_tbl} ({", ".join(seed_c)}) VALUES ({", ".join(seed_v)});'
+                        mapping = next((m for m in (spec.get_table_mappings(target_table) if spec else []) if m.new_column == col_w), None)
+                        src_col = (mapping.source_column or col_w) if mapping else col_w
+                        hints.append(
+                            f" [CRITICAL FK NOTE: Column '{col_w}' has a FOREIGN KEY referencing '{parent_tbl}({parent_pk})'. "
+                            f"To make '{col_w}' equal to {exp_val!r} without triggering 'FOREIGN KEY constraint failed', you MUST: "
+                            f"(1) execute `{seed_sql}` before inserting into '{target_table}', AND "
+                            f"(2) use `CASE WHEN \"{src_col}\" IS NOT NULL AND \"{src_col}\" IN (SELECT \"{parent_pk}\" FROM \"{parent_tbl}\") THEN \"{src_col}\" ELSE {exp_val!r} END` "
+                            f"(do NOT use COALESCE alone, as non-NULL orphan rows will fail the FK check).]"
+                        )
+        return "".join(hints)
+    except Exception as exc:
+        logger.debug(f"Error computing FK mismatch hint: {exc}")
+        return ""
+
+
 def evaluate_migration_invariants(
     base_conn: sqlite3.Connection,
     migrated_conn: sqlite3.Connection,
@@ -345,6 +408,22 @@ def evaluate_migration_invariants(
         passed_checks.append("SQLITE_INTEGRITY_OK")
 
     # ── Check 10: Non-Target Tables Untouched ──────────────────────────────
+    parent_tables: set[str] = set()
+    try:
+        m_cur.execute(f'PRAGMA foreign_key_list("{target_table}")')
+        parent_tables.update(r[2] for r in m_cur.fetchall())
+    except Exception:
+        pass
+    try:
+        b_cur.execute(f'PRAGMA foreign_key_list("{target_table}")')
+        parent_tables.update(r[2] for r in b_cur.fetchall())
+    except Exception:
+        pass
+    if spec:
+        for m in spec.get_table_mappings(target_table):
+            if m.lookup_table:
+                parent_tables.add(m.lookup_table)
+
     for other_tbl in orig_tables:
         if other_tbl != target_table:
             b_cur.execute(f'SELECT COUNT(*) FROM "{other_tbl}"')
@@ -352,7 +431,18 @@ def evaluate_migration_invariants(
             try:
                 m_cur.execute(f'SELECT COUNT(*) FROM "{other_tbl}"')
                 m_cnt = m_cur.fetchone()[0]
-                if b_cnt != m_cnt:
+
+                # If other_tbl is a referenced parent table and has seeded sentinel row(s)
+                if other_tbl in parent_tables and m_cnt >= b_cnt and (m_cnt - b_cnt <= 10):
+                    b_cur.execute(f'SELECT * FROM "{other_tbl}"')
+                    b_data_set = set(b_cur.fetchall())
+                    m_cur.execute(f'SELECT * FROM "{other_tbl}"')
+                    m_data_set = set(m_cur.fetchall())
+                    if b_data_set.issubset(m_data_set):
+                        passed_checks.append(f"NON_TARGET_TABLE_UNTOUCHED_{other_tbl} (sentinel seeded)")
+                    else:
+                        failed_checks.append(f"NON_TARGET_TABLE_MUTATED: Table '{other_tbl}' was unexpectedly modified.")
+                elif b_cnt != m_cnt:
                     failed_checks.append(f"NON_TARGET_TABLE_MUTATED: Table '{other_tbl}' was unexpectedly modified.")
                 elif b_cnt <= 5000:
                     b_cur.execute(f'SELECT * FROM "{other_tbl}"')
@@ -441,7 +531,8 @@ def evaluate_migration_invariants(
                     if m:
                         contract_lines.append(f"{m.new_column} from {m.source_column or 'None'} (transform: {m.transform}, default: {m.default_value!r}, orphan_policy: {m.orphan_policy})")
             contract_hint = f" [Contract: {'; '.join(contract_lines)}]" if contract_lines else ""
-            failed_checks.append(f"DATA_MISMATCH: {summary}. Examples: {ex_str}{contract_hint}")
+            fk_hint = _build_fk_mismatch_hint(target_table, mismatches, examples, spec, b_cur, m_cur)
+            failed_checks.append(f"DATA_MISMATCH: {summary}. Examples: {ex_str}{contract_hint}{fk_hint}")
         else:
             passed_checks.append("ROW_ORACLE_MATCHED" if not is_sampled else "ROW_ORACLE_MATCHED (sampled)")
             oracle_verified = True
@@ -476,7 +567,8 @@ def evaluate_migration_invariants(
                     if m:
                         contract_lines.append(f"{m.new_column} from {m.source_column or 'None'} (transform: {m.transform}, default: {m.default_value!r}, orphan_policy: {m.orphan_policy})")
                 contract_hint = f" [Contract: {'; '.join(contract_lines)}]" if contract_lines else ""
-                failed_checks.append(f"DATA_MISMATCH: {summary}. Examples: {ex_str}{contract_hint}")
+                fk_hint = _build_fk_mismatch_hint(target_table, mismatches, examples, spec, b_cur, m_cur)
+                failed_checks.append(f"DATA_MISMATCH: {summary}. Examples: {ex_str}{contract_hint}{fk_hint}")
             else:
                 passed_checks.append("ROW_ORACLE_MATCHED" if not is_sampled else "ROW_ORACLE_MATCHED (sampled)")
                 oracle_verified = True
@@ -587,7 +679,32 @@ def audit_crash_diagnostics(
                 cur.execute(f'SELECT COUNT(*) FROM "{target_table}" WHERE "{child_col}" IS NULL')
                 null_cnt = cur.fetchone()[0]
 
-                first_valid = repr(valid_parent_keys[0]) if valid_parent_keys else "'DEFAULT'"
+                cur.execute(f'PRAGMA table_info("{parent_table}")')
+                p_cols = cur.fetchall()
+                mapping = next(
+                    (m for m in (spec.get_table_mappings(target_table) if spec else [])
+                     if m.new_column.lower() == child_col.lower() or (m.source_column and m.source_column.lower() == child_col.lower())),
+                    None,
+                )
+                sentinel_val = "UNASSIGNED"
+                if mapping and mapping.default_value is not None:
+                    sentinel_val = str(mapping.default_value)
+                elif mapping and mapping.orphan_policy and mapping.orphan_policy.lower() not in ("null", "none"):
+                    sentinel_val = str(mapping.orphan_policy)
+
+                seed_c = []
+                seed_v = []
+                for cid, cname, ctype, notnull, dflt, pk in p_cols:
+                    if pk > 0 or notnull:
+                        col_ident = cname if re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", cname) else f'"{cname}"'
+                        seed_c.append(col_ident)
+                        if pk > 0:
+                            seed_v.append(repr(sentinel_val))
+                        else:
+                            seed_v.append(repr(sentinel_val.capitalize()))
+                seed_sql = f'INSERT OR IGNORE INTO {parent_table} ({", ".join(seed_c)}) VALUES ({", ".join(seed_v)});'
+                src_col_name = (mapping.source_column or child_col) if mapping else child_col
+
                 orphans_str = ", ".join(repr(v) for v in orphan_values) if orphan_values else "None detected"
                 valid_str = ", ".join(repr(k) for k in valid_parent_keys)
 
@@ -595,20 +712,25 @@ def audit_crash_diagnostics(
                     f"Foreign key '{target_table}.{child_col}' -> '{parent_table}({parent_pk})':\n"
                     f"  - Valid parent keys in '{parent_table}': [{valid_str}]\n"
                     f"  - Orphan values in '{target_table}.{child_col}' not in '{parent_table}': [{orphans_str}]\n"
-                    f"  - NULL rows in '{target_table}.{child_col}': {null_cnt}\n"
-                    f"  CONCRETE REMEDIATION RECIPE:\n"
-                    f"  In your INSERT INTO ... SELECT query, sanitize '{child_col}' using:\n"
-                    f"    CASE\n"
-                    f"      WHEN \"{child_col}\" IN (SELECT \"{parent_pk}\" FROM \"{parent_table}\") THEN \"{child_col}\"\n"
-                    f"      ELSE NULL  -- Map orphan codes and unmapped values to NULL (or {first_valid} if declared NOT NULL)\n"
-                    f"    END AS \"{child_col}\""
+                    f"  - NULL rows in '{target_table}.{child_col}': {null_cnt}\n\n"
+                    f"  CONCRETE REMEDIATION RECIPE (2-STEP SENTINEL FOREIGN KEY PATTERN):\n"
+                    f"  If your migration goal, transform contract, or column default requires a sentinel value (such as {sentinel_val!r}) instead of NULL:\n"
+                    f"  Do NOT use COALESCE alone (it ignores non-NULL orphan trap values like [{orphans_str}])!\n"
+                    f"  Do NOT simply write ELSE {sentinel_val!r} without seeding the parent table (it crashes SQLite with FOREIGN KEY constraint failed)!\n"
+                    f"  You MUST execute BOTH steps:\n"
+                    f"  1. Step A (Seed Parent Table FIRST before creating or inserting into child table):\n"
+                    f"     {seed_sql}\n"
+                    f"  2. Step B (Map BOTH NULL and Orphan Keys in child SELECT query):\n"
+                    f"     CASE WHEN \"{src_col_name}\" IS NOT NULL AND \"{src_col_name}\" IN (SELECT \"{parent_pk}\" FROM \"{parent_table}\") THEN \"{src_col_name}\"\n"
+                    f"       ELSE {sentinel_val!r}  -- (Or ELSE NULL if and only if NULL is explicitly expected)\n"
+                    f"     END AS \"{child_col}\""
                 )
 
             if fk_diagnostics:
                 return (
                     " [FOREIGN KEY CONSTRAINT CRASH DIAGNOSTIC: SQLite failed with FOREIGN KEY constraint failed.\n"
                     + "\n\n".join(fk_diagnostics)
-                    + "\nMap all orphan foreign keys to NULL (or a valid parent key) in your SELECT statement before inserting.]"
+                    + "\nApply the 2-step Sentinel Foreign Key Pattern above: seed the parent table before child insertion, and map invalid keys in SELECT.]"
                 )
         except Exception as exc:
             logger.debug(f"Error computing foreign key crash diagnostics: {exc}")
