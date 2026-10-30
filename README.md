@@ -334,11 +334,31 @@ pyflakes timemachine/ tests/
 ## 🏗️ Model & Infrastructure Stack
 
 - **AI Inference:** [Nebius Token Factory](https://tokenfactory.nebius.com/)
-- **Drafting Model:** `nvidia/nemotron-3-super-120b-a12b` (Low latency)
-- **Deep Repair Model:** `nvidia/Nemotron-3-Ultra-550b-a55b` (Advanced reasoning)
+- **Drafting Model:** `nvidia/nemotron-3-super-120b-a12b` (Low latency drafting & tool calling)
+- **Deep Repair Model:** `nvidia/Nemotron-3-Ultra-550b-a55b` (Advanced reasoning & foreign-key constraint repair)
 - **Database Engine:** `sqlite3` with in-memory `Connection.backup()` RAM cloning
 - **SQL Analysis:** `sqlglot` for transactional statement classification and AST validation
 - **Web Interface:** `streamlit` with stateful session management
+
+---
+
+## 🤖 NVIDIA Nemotron & Nebius Token Factory Integration
+
+### 1. How NVIDIA Nemotron Open-Source Models Are Used
+Our autonomous migration agent utilizes **NVIDIA's Nemotron open-source family** in an intelligent, dual-tier routing architecture:
+- **Fast Tool-Calling & Schema Planning with NVIDIA Nemotron-3 Super (120B):** Handles Tab 2 planning and initial dry-run drafting. It inspects schema DDLs, profiles dirty column distributions, and synthesizes forward/rollback SQL in real time.
+- **Deep Constraint Repair with NVIDIA Nemotron-3 Ultra (550B):** When our deterministic invariant engine detects complex failure states—such as referential integrity traps, orphan foreign keys, or ping-pong oscillation loops—the agent automatically escalates to Nemotron-3 Ultra. The 550B model's multi-step reasoning derives complex 2-step sentinel repair recipes (`INSERT OR IGNORE INTO parent ...` before child insertion) to satisfy strict foreign-key invariants without data loss.
+
+### 2. Where Nebius Token Factory Accelerated Our Workflow
+Nebius Token Factory served as the high-throughput inference backbone that made real-time agentic dry runs viable:
+- **Sub-Second Time-to-First-Token (TTFT):** Multi-turn agent loops (draft ➔ sandbox execute ➔ inspect error ➔ self-repair) require low latency. Token Factory's inference speeds enabled complete 3-turn self-repair cycles in under 10 seconds.
+- **Zero-Friction Integration via OpenAI-Compatible API:** Token Factory provides a seamless `/v1/chat/completions` endpoint, allowing our agent engine to interface with massive 120B and 550B models without requiring heavy local GPU infrastructure or custom serving harnesses.
+- **Dynamic Model Discovery:** Through Token Factory's `/v1/models` endpoint, the Time Machine dynamically inspects available Nemotron deployments at startup, validating model availability and automatically selecting the best active models.
+
+### 3. Nebius Tools & Services Used
+- **Nebius Token Factory API:** Hosted inference serving NVIDIA Nemotron-3 Super (`nvidia/nemotron-3-super-120b-a12b`) and Nemotron-3 Ultra (`nvidia/Nemotron-3-Ultra-550b-a55b`).
+- **Nebius Model Registry Endpoint (`/v1/models`):** Programmatic discovery and validation of available LLM checkpoints at runtime.
+- **Nebius AI Studio:** Workspace environment for API key lifecycle management, token usage monitoring, and quota tracking.
 
 ---
 
